@@ -4,9 +4,12 @@
 # 4. One of them cyclist moves and then after t=threshold 1+ cyclists move.
 
 import os
+import cv2
 import numpy as np
 import polars as pl
 import common
+import requests
+from tqdm import tqdm
 from custom_logger import CustomLogger
 from logmod import logs
 from utils.tools import Tools
@@ -14,6 +17,10 @@ from utils.values import Values
 import warnings
 from itertools import combinations
 from collections import defaultdict
+from typing import Optional, Set, List
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+import pathlib
 
 
 # Suppress the specific FutureWarning
@@ -499,3 +506,319 @@ class Analysis():
                 merged.append(current)
 
         return merged
+
+    def download_videos_from_ftp(self, filename: str, base_url: Optional[str] = None, out_dir: str = ".",
+                                 username: Optional[str] = None, password: Optional[str] = None,
+                                 token: Optional[str] = None, timeout: int = 20):
+
+        """Search for a video file in tue1/tue2/tue3 directories and download it.
+
+        This method crawls through the `/v/{alias}/browse` directories of the
+        provided `base_url` (with aliases "tue1", "tue2", "tue3") to locate
+        and download the specified video file. It returns the local path along
+        with metadata if the file is found and downloaded, otherwise returns None.
+
+        Args:
+            filename (str): Name of the file to search (without extension or with `.mp4`).
+            base_url (str, optional): Root URL of the file server (must end with a slash).
+            out_dir (str, optional): Local directory where the video should be saved.
+                Defaults to the current directory `"."`.
+            username (str, optional): Username for basic authentication.
+            password (str, optional): Password for basic authentication.
+            token (str | None, optional): API token to include as a query parameter
+                in every request. Defaults to None.
+            timeout (int, optional): Request timeout in seconds. Defaults to 20.
+
+        Returns:
+            tuple[str, str, str, float] | None:
+                - Local file path (str)
+                - Original filename (str)
+                - Resolution label (str, e.g., "1080p")
+                - Frames per second (float)
+                Returns None if the file is not found.
+
+        Raises:
+            requests.HTTPError: If an HTTP request fails with a status code error.
+        """
+
+        if base_url is None or base_url == "" or username == "" or password == "":
+            return None
+
+        base_url_str = base_url
+
+        # Ensure filename ends with .mp4
+        filename_with_ext = filename if filename.lower().endswith(".mp4") else f"{filename}.mp4"
+
+        # Ensure trailing slash
+        if not base_url_str.endswith("/"):
+            base_url_str += "/"
+
+        aliases: List[str] = ["tue1", "tue2", "tue3"]
+        visited: Set[str] = set()
+
+        # Build per-request params (avoid touching session.params)
+        req_params: Optional[dict] = {"token": token} if token else None
+
+        try:
+            with requests.Session() as session:
+                session.auth = (username, password) if (username and password) else None
+                session.headers.update({"User-Agent": "multi-fileserver-downloader/1.0"})
+
+                def fetch(url: str) -> Optional[requests.Response]:
+                    try:
+                        r = session.get(url, timeout=timeout, params=req_params)
+                        r.raise_for_status()
+                        return r
+                    except requests.RequestException:
+                        return None
+
+                def is_dir_link(a) -> bool:
+                    href = a.get("href") or ""
+                    return "/browse" in href and href.endswith("/")
+
+                def is_file_link(a) -> bool:
+                    href = a.get("href") or ""
+                    return "/files/" in href
+
+                def crawl(start_url: str) -> Optional[str]:
+                    stack: List[str] = [start_url]
+                    while stack:
+                        url = stack.pop()
+                        if url in visited:
+                            continue
+                        visited.add(url)
+
+                        resp = fetch(url)
+                        if resp is None:
+                            return None
+
+                        try:
+                            soup = BeautifulSoup(resp.text, "html.parser")
+                        except Exception:
+                            return None
+
+                        for a in soup.find_all("a"):
+                            href = a.get("href")
+                            if not href:
+                                continue
+                            full = urljoin(base_url_str, href)
+
+                            if is_file_link(a):
+                                anchor_text = (a.text or "").strip()
+                                if anchor_text == filename_with_ext:
+                                    return full
+
+                                parsed = urlparse(full)
+                                tail = pathlib.PurePosixPath(str(parsed.path)).name
+                                if tail == filename_with_ext and filename_with_ext.lower().endswith(".mp4"):
+                                    return full
+
+                            if is_dir_link(a):
+                                stack.append(full)
+
+                    return None
+
+                for alias in aliases:
+                    start = urljoin(base_url_str, f"v/{alias}/browse")
+                    found_url = crawl(start)
+                    if not found_url:
+                        continue
+
+                    try:
+                        os.makedirs(out_dir, exist_ok=True)
+                        local_path = os.path.join(out_dir, filename_with_ext)
+
+                        with session.get(found_url, stream=True, timeout=timeout, params=req_params) as r:
+                            r.raise_for_status()
+                            total = int(r.headers.get("content-length", 0))
+                            with open(local_path, "wb") as f, tqdm(
+                                total=total,
+                                unit="B",
+                                unit_scale=True,
+                                unit_divisor=1024,
+                                desc=f"Downloading via ftp: {filename_with_ext}",
+                            ) as bar:
+                                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                                    if chunk:
+                                        f.write(chunk)
+                                        bar.update(len(chunk))
+                    except (requests.RequestException, OSError):
+                        return None
+
+                    try:
+                        fps = self.get_video_fps(local_path)
+                        resolution = self.get_video_resolution_label(local_path)
+                    except Exception:
+                        return None
+
+                    return local_path, filename, resolution, fps
+
+                return None
+
+        except Exception:
+            return None
+
+    def draw_yolo_boxes_on_video(self, df, fps, video_path, output_path):
+        """
+        Draw YOLO-style bounding boxes on a video and save the annotated output.
+
+        This method takes a DataFrame containing normalised bounding box coordinates (in YOLO format),
+        matches them frame-by-frame to the input video, draws the corresponding boxes and labels,
+        and writes the resulting video to disk.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing at least the following columns:
+                - 'frame-count': Original frame indices in the source video.
+                - 'X-center', 'Y-center': Normalised center coordinates (0 to 1).
+                - 'width', 'Height': Normalised width and height (0 to 1).
+                - 'unique-id': Identifier to display in the label.
+            fps (float): Frames per second for the output video.
+            video_path (str): Path to the input video file.
+            output_path (str): Path to save the annotated output video.
+
+        Raises:
+            IOError: If the input video cannot be opened.
+        """
+
+        # Ensure the output directory exists
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        # Normalise frame indices to start from 0
+        min_frame = df["frame-count"].min()
+        df["Frame Index"] = df["frame-count"] - min_frame
+
+        # Attempt to open the input video
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise IOError(f"Cannot open video file: {video_path}")
+
+        # Get video dimensions and total number of frames
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Set up video writer with the same resolution and specified fps
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        logger.info(f"Writing to {output_path} ({width}x{height} @ {fps}fps)")
+
+        frame_index = 0
+
+        # Process each frame
+        while frame_index < total_frames:
+            success, frame = cap.read()
+            if not success:
+                logger.error(f"Failed to read frame {frame_index}")
+                break
+
+            # Filter YOLO data for this adjusted frame index
+            frame_data = df[df["Frame Index"] == frame_index]
+
+            for _, row in frame_data.iterrows():
+                # Convert normalised coordinates to absolute pixel values
+                x_center = row["x-center"] * width
+                y_center = row["y-center"] * height
+                w = row["width"] * width
+                h = row["height"] * height
+
+                # Calculate top-left and bottom-right corners of the box
+                x1 = int(x_center - w / 2)
+                y1 = int(y_center - h / 2)
+                x2 = int(x_center + w / 2)
+                y2 = int(y_center + h / 2)
+
+                # Draw rectangle and label with unique ID
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                label = f"ID: {int(row['unique-id'])}"
+                cv2.putText(frame, label, (x1, max(y1 - 10, 0)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            # Write the modified frame to the output video
+            out.write(frame)
+            frame_index += 1
+
+        # Release video objects
+        cap.release()
+        out.release()
+
+    def get_video_fps(self, video_file_path):
+        """
+        Retrieves the frames per second (FPS) of a video file using OpenCV.
+
+        Parameters:
+            video_file_path (str): The file path to the video whose FPS is to be determined.
+
+        Returns:
+            int or None: The rounded FPS value of the video if successful; otherwise, returns None if an error occurs.
+
+        The function performs the following steps:
+            1. Opens the video file using OpenCV's VideoCapture.
+            2. Retrieves the FPS using the CAP_PROP_FPS property.
+            3. Rounds the FPS value to the nearest integer.
+            4. Releases the video resource.
+            5. Returns the rounded FPS value, or None if an exception is encountered.
+        """
+        try:
+            # Open the video file using OpenCV
+            video = cv2.VideoCapture(video_file_path)
+
+            # Retrieve the FPS using OpenCV's CAP_PROP_FPS property
+            fps = video.get(cv2.CAP_PROP_FPS)
+
+            # Release the video resource
+            video.release()
+
+            # Return the FPS rounded to the nearest integer
+            return round(fps, 0)
+        except Exception as e:
+            # Log an error message if FPS retrieval fails
+            logger.error(f"Failed to retrieve FPS: {e}")
+            return None
+
+    def get_video_resolution_label(self, video_path: str) -> str:
+        """Return the resolution label (e.g., '720p', '1080p') for a given video file.
+
+        This method inspects the video file to determine its frame height and then
+        maps it to a common resolution label. If the resolution does not match a
+        well-known standard, it falls back to returning `<height>p`.
+
+        Args:
+            video_path (str): Path to the video file.
+
+        Returns:
+            str: Resolution label (e.g., "720p", "1080p", "2160p").
+                 Falls back to "<height>p" if no predefined label exists.
+
+        Raises:
+            FileNotFoundError: If the provided video path does not exist.
+            RuntimeError: If the video file cannot be opened with OpenCV.
+        """
+        # Ensure the video file exists
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
+
+        # Open video using OpenCV
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {video_path}")
+
+        # Extract video frame height (resolution height in pixels)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+
+        # Map common video resolutions to human-readable labels
+        labels = {
+            144: "144p",
+            240: "240p",
+            360: "360p",
+            480: "480p",
+            720: "720p",
+            1080: "1080p",
+            1440: "1440p",
+            2160: "2160p",  # 4K UHD
+        }
+
+        # Return label if known, otherwise fallback to "<height>p"
+        return labels.get(height, f"{height}p")
