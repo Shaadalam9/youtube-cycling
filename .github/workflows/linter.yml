@@ -1,59 +1,121 @@
 ---
-###########################
-###########################
-## Linter GitHub Actions ##
-###########################
-###########################
-name: Lint codebase
+##############################
+## GitHub Actions: Linting  ##
+##############################
+# This workflow lints the codebase using GitHub Super-Linter v8.
+# It dynamically reads the Python version from `.python-version`
+# and configures mypy to match that version (major.minor).
 
-#
+
 # Documentation:
 # https://help.github.com/en/articles/workflow-syntax-for-github-actions
-#
+# Why generate `mypy.ini`? mypy’s `python_version` expects X.Y (not X.Y.Z).
+# We extract X.Y from `.python-version` and write a minimal config on the fly.
 
-#############################
-# Start the job on all push #
-#############################
+
+# Repo prerequisites:
+# - A `.python-version` file in the repo root (e.g., "3.11.9")
+# - Optional: `.flake8`, `pyproject.toml`, etc., if you use other linters
+
+
+# Notes:
+# - You don't need a committed mypy.ini; this workflow creates one per run.
+# - If `.python-version` is missing, we fallback to 3.11.
+
+name: Lint codebase
+
 on:
   push:
-    # branches-ignore: [master]
-    # Remove the line above to run when pushing to master
   pull_request:
     branches: [main]
 
-###############
-# Set the Job #
-###############
+# Least-privilege permissions for read-only CI
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
-  build:
-    # Name the Job
-    name: Lint codebase
-    # Set the agent to run on
+  lint:
+    name: Run Super-Linter
     runs-on: ubuntu-latest
 
-    ##################
-    # Load all steps #
-    ##################
     steps:
-      ##########################
-      # Checkout the code base #
-      ##########################
-      - name: Checkout code
-        uses: actions/checkout@v2
+      ######################################################################
+      # 1) Checkout full history (helps Super-Linter detect changed files) #
+      ######################################################################
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          # Full git history is needed to get a proper list of changed files within `super-linter`
           fetch-depth: 0
 
-      ################################
-      # Run Linter against code base #
-      ################################
+      ######################################################################
+      # 2) Read Python version from .python-version and export environment  #
+      #    - Stores full version (e.g., 3.11.9) as PY_FULL                  #
+      #    - Derives major.minor (e.g., 3.11) as PY_MAJOR_MINOR for mypy   #
+      ######################################################################
+      - name: Detect Python version from .python-version
+        id: pyver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f ".python-version" ]]; then
+            PY_FULL="$(tr -d '\n\r' < .python-version)"
+            # Extract major.minor (e.g. 3.11 from 3.11.9)
+            PY_MAJOR_MINOR="$(echo "$PY_FULL" | awk -F. '{print $1 "." $2}')"
+          else
+            echo "Warning: .python-version not found. Falling back to 3.11" >&2
+            PY_FULL="3.11.0"
+            PY_MAJOR_MINOR="3.11"
+          fi
+
+          echo "PY_FULL=$PY_FULL" >> "$GITHUB_ENV"
+          echo "PY_MAJOR_MINOR=$PY_MAJOR_MINOR" >> "$GITHUB_ENV"
+          echo "Detected Python (full): $PY_FULL"
+          echo "Detected Python (major.minor): $PY_MAJOR_MINOR"
+
+      ######################################################################
+      # 3) Generate a minimal mypy.ini that pins python_version to X.Y     #
+      #    - ignore_missing_imports can be adjusted to your taste          #
+      #    - add more mypy options here if you want stricter checks        #
+      ######################################################################
+      - name: Generate mypy.ini dynamically
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "[mypy]"
+            echo "python_version = ${PY_MAJOR_MINOR}"
+            echo "ignore_missing_imports = true"
+            # Examples of optional stricter settings you can enable later:
+            # echo "warn_unused_ignores = true"
+            # echo "disallow_untyped_defs = true"
+            # echo "no_implicit_optional = true"
+          } > mypy.ini
+          echo "Generated mypy.ini:"
+          cat mypy.ini
+
+      ######################################################################
+      # 4) Run Super-Linter v8 using the generated mypy.ini                 #
+      #    - VALIDATE_* toggles allow you to enable/disable specific tools #
+      #    - FILTER_REGEX_EXCLUDE excludes README.md from checks           #
+      ######################################################################
       - name: Lint codebase
-        uses: github/super-linter@v3.17.0
+        uses: super-linter/super-linter@v8.2.1
         env:
+          # Required for Super-Linter to comment on PRs / read contents
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # Scope: only lint changed files compared to DEFAULT_BRANCH
           VALIDATE_ALL_CODEBASE: false
           DEFAULT_BRANCH: main
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # Include/exclude filters (regex applied to file paths)
           FILTER_REGEX_INCLUDE: .*
-          FILTER_REGEX_EXCLUDE: README\.md  # This line excludes README.md
+          FILTER_REGEX_EXCLUDE: README\.md
+
+          # Python formatters (disable if you don’t want them to run in CI)
           VALIDATE_PYTHON_BLACK: false
           VALIDATE_PYTHON_ISORT: false
+
+          # Point mypy to our generated config (optional; auto-discovery also works)
+          PYTHON_MYPY_CONFIG_FILE: mypy.ini
