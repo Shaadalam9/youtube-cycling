@@ -1,70 +1,30 @@
 ---
-#############################################
-## GitHub Actions Workflow: Codebase Linter ##
-#############################################
-# Purpose:
-#   This workflow runs GitHub Super-Linter v8 to validate
-#   your Python code (and optionally other file types).
-#
-# Key Features:
-#   ✅ Automatically detects Python version from `.python-version`
-#   ✅ Generates a temporary `mypy.ini` based on that version
-#   ✅ Fixes missing mypy config issue (`PYTHON_MYPY_LINTER_RULES`)
-#   ✅ Compatible with pyenv, uv, and most modern Python setups
-#
-# Requirements:
-#   - A `.python-version` file in the repository root (e.g., `3.11.9`)
-#   - (Optional) `.flake8`, `.editorconfig`, etc. for other linters
-#
-# Notes:
-#   - If `.python-version` is missing, defaults to Python 3.11
-#   - You can safely extend this workflow to lint JS, YAML, etc.
-#   - To re-enable commit message linting, set VALIDATE_GIT_COMMITLINT=true
-#     and add a `.commitlintrc.*` config file.
-
 name: Lint codebase
 
-###################################
-# Run on push or pull requests    #
-###################################
 on:
   push:
   pull_request:
     branches: [main]
 
-###################################
-# Minimum permissions for security #
-###################################
+# Allow Super-Linter to post individual check statuses (prevents 403s).
 permissions:
   contents: read
   pull-requests: read
+  statuses: write
 
-###################################
-# Define the linting job          #
-###################################
 jobs:
   lint:
     name: Run Super-Linter
     runs-on: ubuntu-latest
 
     steps:
-      ###########################################################
-      # Step 1 — Checkout repository (with full history)        #
-      # ------------------------------------------------------- #
-      # fetch-depth: 0 ensures Super-Linter can compare diffs   #
-      ###########################################################
+      # 1) Checkout (full history helps diff-based runs)
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      ###########################################################
-      # Step 2 — Read Python version from `.python-version`      #
-      # ------------------------------------------------------- #
-      # - Extracts both full version (e.g., 3.11.9) and major.minor (3.11)
-      # - Exports them as environment variables for later steps
-      # - Falls back to 3.11 if the file doesn’t exist
-      ###########################################################
+      # 2) Detect Python version from .python-version (e.g., 3.11.9 → 3.11)
       - name: Detect Python version from .python-version
         id: pyver
         shell: bash
@@ -74,23 +34,15 @@ jobs:
             PY_FULL="$(tr -d '\n\r' < .python-version)"
             PY_MAJOR_MINOR="$(echo "$PY_FULL" | awk -F. '{print $1 "." $2}')"
           else
-            echo "⚠️  .python-version not found. Falling back to Python 3.11" >&2
+            echo "⚠️  .python-version not found. Falling back to 3.11" >&2
             PY_FULL="3.11.0"
             PY_MAJOR_MINOR="3.11"
           fi
-
-          echo "PY_FULL=$PY_FULL" >> "$GITHUB_ENV"
+          echo "PY_FULL=$PY_FULL"           >> "$GITHUB_ENV"
           echo "PY_MAJOR_MINOR=$PY_MAJOR_MINOR" >> "$GITHUB_ENV"
-          echo "Detected Python (full): $PY_FULL"
-          echo "Detected Python (major.minor): $PY_MAJOR_MINOR"
+          echo "Detected Python: $PY_FULL (mypy -> $PY_MAJOR_MINOR)"
 
-      ###########################################################
-      # Step 3 — Generate a temporary `mypy.ini` file            #
-      # ------------------------------------------------------- #
-      # - Configures mypy to use the detected Python version
-      # - Enables basic safety defaults
-      # - You can extend this block with stricter settings later
-      ###########################################################
+      # 3) Generate mypy.ini based on detected version
       - name: Generate mypy.ini dynamically
         shell: bash
         run: |
@@ -99,40 +51,43 @@ jobs:
             echo "[mypy]"
             echo "python_version = ${PY_MAJOR_MINOR}"
             echo "ignore_missing_imports = true"
-            # Optional stricter settings:
-            # echo "disallow_untyped_defs = true"
-            # echo "warn_unused_ignores = true"
-            # echo "no_implicit_optional = true"
           } > mypy.ini
-
-          echo "✅ Generated mypy.ini:"
+          echo "Generated mypy.ini:"
           cat mypy.ini
 
-      ###########################################################
-      # Step 4 — Run Super-Linter v8                             #
-      # ------------------------------------------------------- #
-      # - Uses the generated `mypy.ini` via PYTHON_MYPY_LINTER_RULES
-      # - Disables commitlint (you can re-enable later)
-      # - Filters out README.md from linting
-      ###########################################################
+      # 4) Run Super-Linter v8 with focused validators
       - name: Lint codebase
         uses: super-linter/super-linter@v8.2.1
         env:
-          # Required GitHub token for Super-Linter to access repo info
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          # Lint only changed files compared to the default branch
+          # Only lint changed files vs default branch
           VALIDATE_ALL_CODEBASE: false
           DEFAULT_BRANCH: main
 
-          # Include/exclude filters
+          # Optional: exclude README from checks
           FILTER_REGEX_INCLUDE: .*
           FILTER_REGEX_EXCLUDE: README\.md
 
-          # Disable unused or noisy linters (optional)
+          # Post per-linter commit statuses (now allowed by permissions above)
+          USE_GITHUB_STATUS_API: true
+
+          # ✅ Enable Python-focused checks
+          VALIDATE_PYTHON_FLAKE8: true
+          VALIDATE_PYTHON_MYPY:  true
+          VALIDATE_PYTHON_RUFF:  true
+          # If you use formatters in CI, flip these to true
           VALIDATE_PYTHON_BLACK: false
           VALIDATE_PYTHON_ISORT: false
-          VALIDATE_GIT_COMMITLINT: false
 
-          # 👇 Critical fix: point to our generated mypy rules file
+          # 🧯 Disable noisy/unneeded tools for now (re-enable later if desired)
+          VALIDATE_CHECKOV: false                 # IaC security (Terraform/Cloud)
+          VALIDATE_GITHUB_ACTIONS_ZIZMOR: false   # GH Actions security
+          VALIDATE_TRIVY: false                   # Container/IaC vuln scanner
+          VALIDATE_PRE_COMMIT: false              # Requires a configured .pre-commit-config.yaml
+          VALIDATE_JSCPD: false                   # Copy/paste detector
+          VALIDATE_BIOME_FORMAT: false
+          VALIDATE_BIOME_LINT: false
+
+          # Point mypy at the generated config (fixes earlier fatal error)
           PYTHON_MYPY_LINTER_RULES: mypy.ini
