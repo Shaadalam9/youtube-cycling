@@ -1,31 +1,51 @@
 ---
-name: Lint codebase
+##############################################
+## GitHub Actions Workflow: Python Linting  ##
+##############################################
+# Purpose:
+#   Run Super-Linter v8 to lint Python code using
+#   mypy, flake8, ruff (and optionally black, isort).
+#
+# Highlights:
+#   ✅ Dynamically detects Python version from `.python-version`
+#   ✅ Generates a mypy.ini file automatically
+#   ✅ Enables only Python linters (avoids conflict error)
+#   ✅ Grants minimal permissions (no 403s)
+#
+# Compatibility:
+#   - Works with pyenv, uv, and any modern Python setup.
+#   - Defaults to Python 3.11 if `.python-version` is missing.
+
+name: Lint Python Codebase
 
 on:
   push:
   pull_request:
     branches: [main]
 
-# Allow Super-Linter to post individual check statuses (prevents 403s).
 permissions:
   contents: read
   pull-requests: read
-  statuses: write
+  statuses: write  # needed for per-linter status updates
 
 jobs:
   lint:
-    name: Run Super-Linter
+    name: Run Python Linters
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Checkout (full history helps diff-based runs)
+      ###########################################################
+      # 1️⃣ Checkout repository (full history for diffs)        #
+      ###########################################################
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) Detect Python version from .python-version (e.g., 3.11.9 → 3.11)
-      - name: Detect Python version from .python-version
+      ###########################################################
+      # 2️⃣ Detect Python version from `.python-version`         #
+      ###########################################################
+      - name: Detect Python version
         id: pyver
         shell: bash
         run: |
@@ -34,15 +54,17 @@ jobs:
             PY_FULL="$(tr -d '\n\r' < .python-version)"
             PY_MAJOR_MINOR="$(echo "$PY_FULL" | awk -F. '{print $1 "." $2}')"
           else
-            echo "⚠️  .python-version not found. Falling back to 3.11" >&2
+            echo "⚠️  .python-version not found. Defaulting to 3.11"
             PY_FULL="3.11.0"
             PY_MAJOR_MINOR="3.11"
           fi
-          echo "PY_FULL=$PY_FULL"           >> "$GITHUB_ENV"
+          echo "PY_FULL=$PY_FULL" >> "$GITHUB_ENV"
           echo "PY_MAJOR_MINOR=$PY_MAJOR_MINOR" >> "$GITHUB_ENV"
-          echo "Detected Python: $PY_FULL (mypy -> $PY_MAJOR_MINOR)"
+          echo "Detected Python: $PY_FULL (→ mypy $PY_MAJOR_MINOR)"
 
-      # 3) Generate mypy.ini based on detected version
+      ###########################################################
+      # 3️⃣ Generate a `mypy.ini` dynamically                    #
+      ###########################################################
       - name: Generate mypy.ini dynamically
         shell: bash
         run: |
@@ -52,42 +74,34 @@ jobs:
             echo "python_version = ${PY_MAJOR_MINOR}"
             echo "ignore_missing_imports = true"
           } > mypy.ini
-          echo "Generated mypy.ini:"
+          echo "✅ Generated mypy.ini:"
           cat mypy.ini
 
-      # 4) Run Super-Linter v8 with focused validators
-      - name: Lint codebase
+      ###########################################################
+      # 4️⃣ Run Super-Linter v8 (Python-only mode)               #
+      ###########################################################
+      - name: Lint Python code
         uses: super-linter/super-linter@v8.2.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          # Only lint changed files vs default branch
+          # Limit Super-Linter to Python linters only.
+          # When you set VALIDATE_PYTHON_* to true, do NOT mix in false flags.
+          VALIDATE_PYTHON_FLAKE8: true
+          VALIDATE_PYTHON_MYPY: true
+          VALIDATE_PYTHON_RUFF: true
+          # Optional formatters (enable if desired):
+          # VALIDATE_PYTHON_BLACK: true
+          # VALIDATE_PYTHON_ISORT: true
+
+          # Point to the generated mypy rules file
+          PYTHON_MYPY_LINTER_RULES: mypy.ini
+
+          # Super-Linter control flags
           VALIDATE_ALL_CODEBASE: false
           DEFAULT_BRANCH: main
-
-          # Optional: exclude README from checks
           FILTER_REGEX_INCLUDE: .*
           FILTER_REGEX_EXCLUDE: README\.md
 
-          # Post per-linter commit statuses (now allowed by permissions above)
+          # Enables commit statuses (requires `statuses: write` permission)
           USE_GITHUB_STATUS_API: true
-
-          # ✅ Enable Python-focused checks
-          VALIDATE_PYTHON_FLAKE8: true
-          VALIDATE_PYTHON_MYPY:  true
-          VALIDATE_PYTHON_RUFF:  true
-          # If you use formatters in CI, flip these to true
-          VALIDATE_PYTHON_BLACK: false
-          VALIDATE_PYTHON_ISORT: false
-
-          # 🧯 Disable noisy/unneeded tools for now (re-enable later if desired)
-          VALIDATE_CHECKOV: false                 # IaC security (Terraform/Cloud)
-          VALIDATE_GITHUB_ACTIONS_ZIZMOR: false   # GH Actions security
-          VALIDATE_TRIVY: false                   # Container/IaC vuln scanner
-          VALIDATE_PRE_COMMIT: false              # Requires a configured .pre-commit-config.yaml
-          VALIDATE_JSCPD: false                   # Copy/paste detector
-          VALIDATE_BIOME_FORMAT: false
-          VALIDATE_BIOME_LINT: false
-
-          # Point mypy at the generated config (fixes earlier fatal error)
-          PYTHON_MYPY_LINTER_RULES: mypy.ini
