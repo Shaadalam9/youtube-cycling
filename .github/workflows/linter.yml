@@ -1,58 +1,70 @@
 ---
-##############################
-## GitHub Actions: Linting  ##
-##############################
-# This workflow lints the codebase using GitHub Super-Linter v8.
-# It dynamically reads the Python version from `.python-version`
-# and configures mypy to match that version (major.minor).
-
-
-# Documentation:
-# https://help.github.com/en/articles/workflow-syntax-for-github-actions
-# Why generate `mypy.ini`? mypy’s `python_version` expects X.Y (not X.Y.Z).
-# We extract X.Y from `.python-version` and write a minimal config on the fly.
-
-
-# Repo prerequisites:
-# - A `.python-version` file in the repo root (e.g., "3.11.9")
-# - Optional: `.flake8`, `pyproject.toml`, etc., if you use other linters
-
-
+#############################################
+## GitHub Actions Workflow: Codebase Linter ##
+#############################################
+# Purpose:
+#   This workflow runs GitHub Super-Linter v8 to validate
+#   your Python code (and optionally other file types).
+#
+# Key Features:
+#   ✅ Automatically detects Python version from `.python-version`
+#   ✅ Generates a temporary `mypy.ini` based on that version
+#   ✅ Fixes missing mypy config issue (`PYTHON_MYPY_LINTER_RULES`)
+#   ✅ Compatible with pyenv, uv, and most modern Python setups
+#
+# Requirements:
+#   - A `.python-version` file in the repository root (e.g., `3.11.9`)
+#   - (Optional) `.flake8`, `.editorconfig`, etc. for other linters
+#
 # Notes:
-# - You don't need a committed mypy.ini; this workflow creates one per run.
-# - If `.python-version` is missing, we fallback to 3.11.
+#   - If `.python-version` is missing, defaults to Python 3.11
+#   - You can safely extend this workflow to lint JS, YAML, etc.
+#   - To re-enable commit message linting, set VALIDATE_GIT_COMMITLINT=true
+#     and add a `.commitlintrc.*` config file.
 
 name: Lint codebase
 
+###################################
+# Run on push or pull requests    #
+###################################
 on:
   push:
   pull_request:
     branches: [main]
 
-# Least-privilege permissions for read-only CI
+###################################
+# Minimum permissions for security #
+###################################
 permissions:
   contents: read
   pull-requests: read
 
+###################################
+# Define the linting job          #
+###################################
 jobs:
   lint:
     name: Run Super-Linter
     runs-on: ubuntu-latest
 
     steps:
-      ######################################################################
-      # 1) Checkout full history (helps Super-Linter detect changed files) #
-      ######################################################################
+      ###########################################################
+      # Step 1 — Checkout repository (with full history)        #
+      # ------------------------------------------------------- #
+      # fetch-depth: 0 ensures Super-Linter can compare diffs   #
+      ###########################################################
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      ######################################################################
-      # 2) Read Python version from .python-version and export environment  #
-      #    - Stores full version (e.g., 3.11.9) as PY_FULL                  #
-      #    - Derives major.minor (e.g., 3.11) as PY_MAJOR_MINOR for mypy   #
-      ######################################################################
+      ###########################################################
+      # Step 2 — Read Python version from `.python-version`      #
+      # ------------------------------------------------------- #
+      # - Extracts both full version (e.g., 3.11.9) and major.minor (3.11)
+      # - Exports them as environment variables for later steps
+      # - Falls back to 3.11 if the file doesn’t exist
+      ###########################################################
       - name: Detect Python version from .python-version
         id: pyver
         shell: bash
@@ -60,10 +72,9 @@ jobs:
           set -euo pipefail
           if [[ -f ".python-version" ]]; then
             PY_FULL="$(tr -d '\n\r' < .python-version)"
-            # Extract major.minor (e.g. 3.11 from 3.11.9)
             PY_MAJOR_MINOR="$(echo "$PY_FULL" | awk -F. '{print $1 "." $2}')"
           else
-            echo "Warning: .python-version not found. Falling back to 3.11" >&2
+            echo "⚠️  .python-version not found. Falling back to Python 3.11" >&2
             PY_FULL="3.11.0"
             PY_MAJOR_MINOR="3.11"
           fi
@@ -73,11 +84,13 @@ jobs:
           echo "Detected Python (full): $PY_FULL"
           echo "Detected Python (major.minor): $PY_MAJOR_MINOR"
 
-      ######################################################################
-      # 3) Generate a minimal mypy.ini that pins python_version to X.Y     #
-      #    - ignore_missing_imports can be adjusted to your taste          #
-      #    - add more mypy options here if you want stricter checks        #
-      ######################################################################
+      ###########################################################
+      # Step 3 — Generate a temporary `mypy.ini` file            #
+      # ------------------------------------------------------- #
+      # - Configures mypy to use the detected Python version
+      # - Enables basic safety defaults
+      # - You can extend this block with stricter settings later
+      ###########################################################
       - name: Generate mypy.ini dynamically
         shell: bash
         run: |
@@ -86,36 +99,40 @@ jobs:
             echo "[mypy]"
             echo "python_version = ${PY_MAJOR_MINOR}"
             echo "ignore_missing_imports = true"
-            # Examples of optional stricter settings you can enable later:
-            # echo "warn_unused_ignores = true"
+            # Optional stricter settings:
             # echo "disallow_untyped_defs = true"
+            # echo "warn_unused_ignores = true"
             # echo "no_implicit_optional = true"
           } > mypy.ini
-          echo "Generated mypy.ini:"
+
+          echo "✅ Generated mypy.ini:"
           cat mypy.ini
 
-      ######################################################################
-      # 4) Run Super-Linter v8 using the generated mypy.ini                 #
-      #    - VALIDATE_* toggles allow you to enable/disable specific tools #
-      #    - FILTER_REGEX_EXCLUDE excludes README.md from checks           #
-      ######################################################################
+      ###########################################################
+      # Step 4 — Run Super-Linter v8                             #
+      # ------------------------------------------------------- #
+      # - Uses the generated `mypy.ini` via PYTHON_MYPY_LINTER_RULES
+      # - Disables commitlint (you can re-enable later)
+      # - Filters out README.md from linting
+      ###########################################################
       - name: Lint codebase
         uses: super-linter/super-linter@v8.2.1
         env:
-          # Required for Super-Linter to comment on PRs / read contents
+          # Required GitHub token for Super-Linter to access repo info
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          # Scope: only lint changed files compared to DEFAULT_BRANCH
+          # Lint only changed files compared to the default branch
           VALIDATE_ALL_CODEBASE: false
           DEFAULT_BRANCH: main
 
-          # Include/exclude filters (regex applied to file paths)
+          # Include/exclude filters
           FILTER_REGEX_INCLUDE: .*
           FILTER_REGEX_EXCLUDE: README\.md
 
-          # Python formatters (disable if you don’t want them to run in CI)
+          # Disable unused or noisy linters (optional)
           VALIDATE_PYTHON_BLACK: false
           VALIDATE_PYTHON_ISORT: false
+          VALIDATE_GIT_COMMITLINT: false
 
-          # Point mypy to our generated config (optional; auto-discovery also works)
-          PYTHON_MYPY_CONFIG_FILE: mypy.ini
+          # 👇 Critical fix: point to our generated mypy rules file
+          PYTHON_MYPY_LINTER_RULES: mypy.ini
