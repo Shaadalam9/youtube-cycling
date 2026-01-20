@@ -6,12 +6,16 @@ readme = "README.md"
 requires-python = "==3.11.9"
 dependencies = [
     "bs4>=0.0.2",
+    "geopy>=2.4.1",
     "kaleido",
+    "moviepy>=2.2.1",
     "numpy==2.3.4",
     "opencv-python>=4.11.0.86",
+    "pandas>=2.3.3",
     "pathlib>=1.0.1",
     "plotly==6.3.1",
     "polars==1.34.0",
+    "pycountry>=24.6.1",
     "requests>=2.32.5",
     "tqdm>=4.67.1",
 ]

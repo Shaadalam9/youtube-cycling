@@ -1,107 +1,89 @@
 ---
-##############################################
-## GitHub Actions Workflow: Python Linting  ##
-##############################################
-# Purpose:
-#   Run Super-Linter v8 to lint Python code using
-#   mypy, flake8, ruff (and optionally black, isort).
-#
-# Highlights:
-#   ✅ Dynamically detects Python version from `.python-version`
-#   ✅ Generates a mypy.ini file automatically
-#   ✅ Enables only Python linters (avoids conflict error)
-#   ✅ Grants minimal permissions (no 403s)
-#
-# Compatibility:
-#   - Works with pyenv, uv, and any modern Python setup.
-#   - Defaults to Python 3.11 if `.python-version` is missing.
+############################
+# Super-Linter GitHub Action
+############################
+name: Lint
 
-name: Lint Python Codebase
-
+############################
+# Triggers
+############################
 on:
   push:
+    branches: [main]
   pull_request:
     branches: [main]
 
+############################
+# Minimal permissions
+# - contents: read -> checkout code
+# - statuses: write -> allow Super-linter to post status checks
+############################
 permissions:
   contents: read
-  pull-requests: read
-  statuses: write  # needed for per-linter status updates
+  statuses: write
 
 jobs:
   lint:
-    name: Run Python Linters
+    name: Super-linter (allow-list)
     runs-on: ubuntu-latest
 
     steps:
-      ###########################################################
-      # 1️⃣ Checkout repository (full history for diffs)        #
-      ###########################################################
-      - name: Checkout repository
+      ##########################
+      # Checkout repository
+      ##########################
+      - name: Checkout
         uses: actions/checkout@v4
         with:
+          # Needed so Super-linter can compute the "changed files" set
           fetch-depth: 0
 
-      ###########################################################
-      # 2️⃣ Detect Python version from `.python-version`         #
-      ###########################################################
-      - name: Detect Python version
-        id: pyver
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -f ".python-version" ]]; then
-            PY_FULL="$(tr -d '\n\r' < .python-version)"
-            PY_MAJOR_MINOR="$(echo "$PY_FULL" | awk -F. '{print $1 "." $2}')"
-          else
-            echo "⚠️  .python-version not found. Defaulting to 3.11"
-            PY_FULL="3.11.0"
-            PY_MAJOR_MINOR="3.11"
-          fi
-          echo "PY_FULL=$PY_FULL" >> "$GITHUB_ENV"
-          echo "PY_MAJOR_MINOR=$PY_MAJOR_MINOR" >> "$GITHUB_ENV"
-          echo "Detected Python: $PY_FULL (→ mypy $PY_MAJOR_MINOR)"
-
-      ###########################################################
-      # 3️⃣ Generate a `mypy.ini` dynamically                    #
-      ###########################################################
-      - name: Generate mypy.ini dynamically
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "[mypy]"
-            echo "python_version = ${PY_MAJOR_MINOR}"
-            echo "ignore_missing_imports = true"
-          } > mypy.ini
-          echo "✅ Generated mypy.ini:"
-          cat mypy.ini
-
-      ###########################################################
-      # 4️⃣ Run Super-Linter v8 (Python-only mode)               #
-      ###########################################################
-      - name: Lint Python code
-        uses: super-linter/super-linter@v8.2.1
+      ##########################
+      # Run Super-linter
+      ##########################
+      - name: Run Super-linter
+        uses: super-linter/super-linter@v8.3.2
         env:
+          ##########################
+          # Required
+          ##########################
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-          # Limit Super-Linter to Python linters only.
-          # When you set VALIDATE_PYTHON_* to true, do NOT mix in false flags.
-          VALIDATE_PYTHON_FLAKE8: true
-          VALIDATE_PYTHON_MYPY: true
-          VALIDATE_PYTHON_RUFF: true
-          # Optional formatters (enable if desired):
-          # VALIDATE_PYTHON_BLACK: true
-          # VALIDATE_PYTHON_ISORT: true
-
-          # Point to the generated mypy rules file
-          PYTHON_MYPY_LINTER_RULES: mypy.ini
-
-          # Super-Linter control flags
-          VALIDATE_ALL_CODEBASE: false
           DEFAULT_BRANCH: main
-          FILTER_REGEX_INCLUDE: .*
-          FILTER_REGEX_EXCLUDE: README\.md
 
-          # Enables commit statuses (requires `statuses: write` permission)
-          USE_GITHUB_STATUS_API: true
+          ##########################
+          # Only lint changed files
+          ##########################
+          VALIDATE_ALL_CODEBASE: false
+
+          ##########################
+          # Use repo-provided linter configs
+          ##########################
+          LINTER_RULES_PATH: .github/linters
+          JSCPD_CONFIG_FILE: .jscpd.json
+
+          ##########################
+          # Optional filtering (applies to most tools, but NOT all)
+          ##########################
+          FILTER_REGEX_EXCLUDE: (README\.md|figures/.*)
+
+          ############################################################
+          # IMPORTANT: Allow-list mode
+          #
+          # Super-linter rules:
+          # - If you set ANY VALIDATE_* to true, all others default to false.
+          #   (So you avoid BIOME/CHECKOV/Zizmor/etc unless you explicitly enable them.)
+          ############################################################
+          VALIDATE_GITHUB_ACTIONS: true
+          VALIDATE_YAML: true
+          VALIDATE_YAML_PRETTIER: true
+
+          # Python: pick a minimal, practical set
+          VALIDATE_PYTHON_FLAKE8: true
+          VALIDATE_PYTHON_RUFF: true
+
+          # Optional: enable these only when your repo is ready
+          # VALIDATE_PYTHON_RUFF_FORMAT: true
+          # VALIDATE_PYTHON_MYPY: true
+          # VALIDATE_PYTHON_PYLINT: true
+
+          # Optional: run duplicate-code checks (note: JSCPD always scans the whole workspace)
+          VALIDATE_JSCPD: true
