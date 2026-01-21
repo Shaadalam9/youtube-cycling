@@ -112,7 +112,7 @@ secret
 .mypi.ini
 .venv
 
-
 # Saved files
 /output
 /data
+/videos

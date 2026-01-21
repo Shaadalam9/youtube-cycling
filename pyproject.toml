@@ -8,7 +8,7 @@ dependencies = [
     "bs4>=0.0.2",
     "geopy>=2.4.1",
     "kaleido",
-    "moviepy>=2.2.1",
+    "moviepy==1.0.3",
     "numpy==2.3.4",
     "opencv-python>=4.11.0.86",
     "pandas>=2.3.3",

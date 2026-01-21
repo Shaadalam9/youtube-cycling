@@ -104,3 +104,13 @@ source .venv/bin/activate
 ```command line
 python3 main.py
 ```
+
+### Configuration of project
+Configuration of the project needs to be defined in `config`. Please use the `default.config` file for the required structure of the file. If no custom config file is provided, `default.config` is used. The config file has the following parameters:
+- **`data`**: Directory containing data (CSV output from YOLO).
+- **`videos`**: Directories containing the videos used to generate the data.
+- **`mapping`**: CSV file that contains mapping data for the cities referenced in the data.
+- **`always_analyse`**: Always conduct analysis even when pickle files are present (good for testing).
+- **`min_confidence`**: Sets the confidence threshold parameter for YOLO.
+- **`font_family`**: Specifies the font family to be used in outputs.
+- **`font_size`**: Specifies the font size to be used in outputs.

@@ -10,6 +10,7 @@ import pathlib
 from bs4 import BeautifulSoup
 import polars as pl
 import cv2
+from types import SimpleNamespace                # lightweight config container
 from utils.bicyclist_detect import Algorithm
 from utils.bicyclist_following import CyclistFollowing, FollowingParams
 from utils.analytics.io import IO
@@ -28,6 +29,35 @@ MISC_FILES: Set[str] = {"DS_Store"}
 
 
 logger = CustomLogger(__name__)  # use custom logger
+
+# -----------------------------------------------------------------------------
+# USER PARAMETERS (edit these variables; no argparse / no CLI parser is used)
+# -----------------------------------------------------------------------------
+# When True: if cyclist-following episodes are detected in a CSV, the script will
+# download the corresponding source video and generate an annotated video showing
+# the involved cyclists (and their bicycles) across the entire CSV segment.
+DOWNLOAD_AND_ANNOTATE: bool = True
+
+# Output folders
+videos_dir: str = common.get_configs("videos")
+DOWNLOADED_VIDEOS_DIR = os.path.join(videos_dir, "downloaded_video")
+ANNOTATED_VIDEOS_DIR = os.path.join(videos_dir, "annotated_video")
+TRIMMED_CLIPS_DIR = os.path.join(videos_dir, "trimmed_video")
+
+# If True, keep the intermediate trimmed clip on disk. If False, it will be deleted
+# after the annotated video is written successfully.
+KEEP_TRIMMED_CLIP: bool = False
+
+# -----------------------------------------------------------------------------
+# ANNOTATION COLORS (BGR)
+# -----------------------------------------------------------------------------
+# follower  : cyclist that is following another cyclist
+# following : cyclist that is being followed (leader in episodes table)
+# normal    : cyclist that is not in a following episode
+COLOR_CYCLIST_FOLLOWER = (0, 0, 255)   # red
+COLOR_CYCLIST_FOLLOWING = (0, 255, 0)  # green
+COLOR_CYCLIST_NORMAL = (0, 215, 255)   # orange/yellow-ish (visible on most backgrounds)
+COLOR_BICYCLE = (255, 0, 0)            # blue
 
 
 class Analysis():
@@ -87,6 +117,19 @@ class Analysis():
 
         filename_with_ext = filename if filename.lower().endswith(".mp4") else f"{filename}.mp4"
         filename_lower = filename_with_ext.lower()
+
+        # Local cache: if the file is already present on disk, reuse it.
+        os.makedirs(out_dir, exist_ok=True)
+        cached_path = os.path.join(out_dir, filename_with_ext)
+        if os.path.exists(cached_path) and os.path.getsize(cached_path) > 0:
+            resolution, fps_meta = "unknown", 0.0
+            try:
+                fps_meta = float(Analysis.get_video_fps(cached_path))
+                resolution = Analysis.get_video_resolution_label(cached_path)
+            except Exception:
+                pass
+            logger.info(f"Using cached video: {cached_path}")
+            return cached_path, filename_with_ext, resolution, fps_meta
         aliases = ["tue1", "tue2", "tue3", "tue4"]
 
         req_params = {"token": token} if token else None
@@ -172,7 +215,7 @@ class Analysis():
                     logger.warning(f"Metadata extraction failed: {e}")
 
                 logger.info(f"✅ Saved '{filename_with_ext}' (res={resolution}, fps={fps})")
-                return local_path, filename, resolution, fps
+                return local_path, filename_with_ext, resolution, fps
 
             # ---------- 2. Crawl /browse fallback ----------
             visited: Set[str] = set()
@@ -274,10 +317,201 @@ class Analysis():
                 except Exception as e:
                     logger.warning(f"Metadata extraction failed: {e}")
 
-                return local_path, filename, resolution, fps
+                return local_path, filename_with_ext, resolution, fps
 
             logger.warning(f"File '{filename_with_ext}' not found in any alias.")
             return None
+
+    @staticmethod
+    def get_video_fps(video_path: str) -> float:
+        """Return FPS for a local video file (OpenCV)."""
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {video_path}")
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        cap.release()
+        return fps
+
+    def annotate_following_segment(
+        self,
+        *,
+        input_video_path: str,
+        output_video_path: str,
+        df: pl.DataFrame,
+        cyclist_map: pl.DataFrame,
+        episodes: pl.DataFrame,
+        involved_cyclist_ids: set[int],
+        frame_offset: int = 0,
+        fps_override: Optional[float] = None,
+    ) -> None:
+        """
+        Create an annotated video for the CSV segment.
+
+        - Reads frames from input_video_path.
+        - Draws bounding boxes for involved cyclists (yolo-id=0) and their bicycles (yolo-id=1).
+        - If a frame is within an episode interval, labels cyclists as follower/leader.
+
+        Notes:
+        - Output is written WITHOUT audio (OpenCV VideoWriter).
+        - frame_offset is used if CSV frame-count does not start at 0.
+        """
+        os.makedirs(os.path.dirname(output_video_path) or ".", exist_ok=True)
+
+        # Determine cyclists to draw. If no specific involved_cyclist_ids were provided,
+        # annotate ALL bicyclists present in cyclist_map.
+        cyclist_ids: set[int] = set(int(x) for x in involved_cyclist_ids) if involved_cyclist_ids else set()
+        if cyclist_map.height > 0 and not cyclist_ids:
+            try:
+                cyclist_ids = set(int(x) for x in cyclist_map.get_column("cyclist_id").to_list())
+            except Exception:
+                cyclist_ids = set()
+
+        # Build corresponding bicycle IDs from cyclist_map
+        bicycle_ids: set[int] = set()
+        if cyclist_map.height > 0 and cyclist_ids:
+            try:
+                bicycle_ids = set(
+                    cyclist_map
+                    .filter(pl.col("cyclist_id").is_in(list(cyclist_ids)))
+                    .get_column("bicycle_id")
+                    .to_list()
+                )
+                bicycle_ids = set(int(x) for x in bicycle_ids)
+            except Exception:
+                bicycle_ids = set()
+
+        object_ids_to_draw = cyclist_ids | bicycle_ids
+
+        # Pre-index the CSV rows we care about: frame -> list[rows]
+        frame_to_rows: dict[int, list[dict]] = {}
+        if df.height > 0 and object_ids_to_draw:
+            wanted = (
+                df.filter(pl.col("unique-id").is_in(list(object_ids_to_draw)))
+                .select(["frame-count", "yolo-id", "unique-id", "x-center", "y-center", "width", "height"])
+            )
+            for row in wanted.iter_rows(named=True):
+                fc = int(row["frame-count"])
+                frame_to_rows.setdefault(fc, []).append(row)
+
+                # CSV bbox coordinates are normalised to [0,1] (YOLO format) in this project.
+        # We therefore always interpret x-center/y-center/width/height as normalised values.
+        coords_normalised = True
+
+# Episode intervals for quick role lookup
+        intervals: list[tuple[int, int, int, int]] = []
+        if episodes.height > 0:
+            try:
+                for r in episodes.select(["start_frame",
+                                          "end_frame",
+                                          "follower_id",
+                                          "leader_id"]).iter_rows(named=True):
+                    intervals.append(
+                        (int(r["start_frame"]), int(r["end_frame"]), int(r["follower_id"]), int(r["leader_id"]))
+                    )
+            except Exception:
+                intervals = []
+
+        def roles_for_frame(frame_count: int) -> dict[int, str]:
+            roles: dict[int, str] = {}
+            for s, e, fid, lid in intervals:
+                if s <= frame_count <= e:
+                    roles[fid] = "follower"
+                    roles[lid] = "following"
+            return roles
+
+        cap = cv2.VideoCapture(input_video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {input_video_path}")
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
+        fps = (
+            float(fps_override)
+            if (fps_override is not None and float(fps_override) > 0)
+            else float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        )
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore
+        out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+        if not out.isOpened():
+            cap.release()
+            raise RuntimeError(f"Could not open VideoWriter: {output_video_path}")
+
+        frame_idx = 0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+
+                csv_frame = frame_idx + int(frame_offset)
+                roles = roles_for_frame(csv_frame)
+
+                for row in frame_to_rows.get(csv_frame, []):
+                    yolo_id = int(row["yolo-id"])
+                    obj_id = int(row["unique-id"])
+
+                    xc = float(row["x-center"])
+                    yc = float(row["y-center"])
+                    w = float(row["width"])
+                    h = float(row["height"])
+                    # CSV coords are normalised to [0,1] (YOLO format). Convert to pixel coords for drawing.
+                    if coords_normalised:
+                        xc_px = xc * width
+                        yc_px = yc * height
+                        w_px = w * width
+                        h_px = h * height
+                    else:
+                        xc_px = xc
+                        yc_px = yc
+                        w_px = w
+                        h_px = h
+
+                    x1 = int(round(xc_px - w_px / 2.0))
+                    y1 = int(round(yc_px - h_px / 2.0))
+                    x2 = int(round(xc_px + w_px / 2.0))
+                    y2 = int(round(yc_px + h_px / 2.0))
+
+                    # Clip to frame bounds
+                    x1 = max(0, min(width - 1, x1))
+                    x2 = max(0, min(width - 1, x2))
+                    y1 = max(0, min(height - 1, y1))
+                    y2 = max(0, min(height - 1, y2))
+
+                    # Colors: follower (red), following (green), normal (orange), bicycle (blue)
+                    if yolo_id == 0:  # cyclist/person
+                        role = roles.get(obj_id, "normal")
+                        if role == "follower":
+                            color = COLOR_CYCLIST_FOLLOWER
+                        elif role == "following":
+                            color = COLOR_CYCLIST_FOLLOWING
+                        else:
+                            color = COLOR_CYCLIST_NORMAL
+                        label = f"{role}:{obj_id}"
+                    else:  # bicycle / other object
+                        color = COLOR_BICYCLE
+                        label = f"bicycle:{obj_id}"
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(
+                        frame,
+                        label,
+                        (x1, max(0, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        color,
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+                out.write(frame)
+                frame_idx += 1
+        finally:
+            cap.release()
+            out.release()
 
     @staticmethod
     def get_video_resolution_label(video_path: str) -> str:
@@ -395,6 +629,17 @@ class Analysis():
 if __name__ == "__main__":
     logger.info("Analysis started.")
 
+    # ---------------------------------------------------------------------
+    # Load secrets (email + FTP credentials)
+    # ---------------------------------------------------------------------
+    secret = SimpleNamespace(
+        email_smtp=common.get_secrets("email_smtp"),
+        email_account=common.get_secrets("email_account"),
+        email_password=common.get_secrets("email_password"),
+        ftp_username=common.get_secrets("ftp_username"),
+        ftp_password=common.get_secrets("ftp_password"),
+    )
+
     df_mapping = pl.read_csv(common.get_configs("mapping"))
     min_conf = common.get_configs("min_confidence")
 
@@ -403,6 +648,8 @@ if __name__ == "__main__":
         int(row_id): (city, state, country)
         for row_id, city, state, country in df_mapping.select(["id", "city", "state", "country"]).iter_rows()
     }
+
+    analysis = Analysis()
 
     for folder_path in common.get_configs("data"):  # Iterable[str]
         if not os.path.exists(folder_path):
@@ -466,5 +713,88 @@ if __name__ == "__main__":
                 ),
                 fps=None,   # set if you know it, e.g. fps=30
             )
-            logger.info(cyclist_map)
-            logger.info(episodes)
+            print(cyclist_map)
+
+            print(episodes)
+
+            # If enabled, download the source video and generate an annotated video for this CSV segment
+            logger.info(f"{file_str}: annotation pipeline triggered (DOWNLOAD_AND_ANNOTATE={DOWNLOAD_AND_ANNOTATE},bicyclists={cyclist_map.height})")  # noqa: E501
+            if DOWNLOAD_AND_ANNOTATE and cyclist_map.height > 0:
+                try:
+                    involved_cyclists: set[int] = set()
+                    if "follower_id" in episodes.columns:
+                        involved_cyclists |= set(episodes.get_column("follower_id").to_list())
+                    if "leader_id" in episodes.columns:
+                        involved_cyclists |= set(episodes.get_column("leader_id").to_list())
+
+                    # Download base video (cached if already present on disk)
+                    dl = analysis.download_videos_from_ftp(
+                        filename=video_id,
+                        base_url=common.get_configs("ftp_server"),
+                        out_dir=DOWNLOADED_VIDEOS_DIR,
+                        username=getattr(secret, "ftp_username", None),
+                        password=getattr(secret, "ftp_password", None),
+                        token=getattr(secret, "ftp_token", None),
+                    )
+                    if dl is None:
+                        logger.warning(f"{file_str}: could not download video for video_id='{video_id}'.")
+                        continue
+
+                    local_video_path, downloaded_name, resolution, downloaded_fps = dl
+                    logger.info(f"{file_str}: downloaded video '{downloaded_name}' ({resolution}, fps={downloaded_fps}).")  # noqa: E501
+
+                    # Compute segment [start_seconds, end_seconds] from CSV filename + frame-count
+                    try:
+                        start_seconds = float(start_index)
+                    except Exception:
+                        logger.warning(f"{file_str}: could not parse start time from '{start_index}'. Skipping video.")
+                        continue
+
+                    # CSV fps (from filename) is the best alignment hint; fall back to downloaded fps
+                    fps_value = 0.0
+                    try:
+                        fps_value = float(fps)
+                    except Exception:
+                        fps_value = float(downloaded_fps or 0.0)
+
+                    if fps_value <= 0:
+                        fps_value = 25.0
+
+                    min_frame = int(df.select(pl.min("frame-count")).item()) if df.height > 0 else 0
+                    max_frame = int(df.select(pl.max("frame-count")).item()) if df.height > 0 else 0
+                    n_frames = max(0, (max_frame - min_frame + 1))
+                    duration_seconds = (n_frames / fps_value) if fps_value > 0 else 0.0
+                    end_seconds = start_seconds + duration_seconds
+
+                    # Trim to the CSV segment, then annotate the whole segment
+                    os.makedirs(TRIMMED_CLIPS_DIR, exist_ok=True)
+                    clip_path = os.path.join(TRIMMED_CLIPS_DIR, f"{filename_no_ext}.mp4")
+                    analysis.trim_video(local_video_path, clip_path, start_seconds, end_seconds)
+
+                    os.makedirs(ANNOTATED_VIDEOS_DIR, exist_ok=True)
+                    annotated_suffix = "following_annotated" if episodes.height > 0 else "annotated"
+
+                    annotated_path = os.path.join(
+                        ANNOTATED_VIDEOS_DIR, f"{filename_no_ext}_{annotated_suffix}.mp4"
+                    )
+
+                    analysis.annotate_following_segment(
+                        input_video_path=clip_path,
+                        output_video_path=annotated_path,
+                        df=df,
+                        cyclist_map=cyclist_map,
+                        episodes=episodes,
+                        involved_cyclist_ids=involved_cyclists,
+                        frame_offset=min_frame,
+                        fps_override=fps_value,
+                    )
+                    logger.info(f"{file_str}: annotated video written to {annotated_path}")
+
+                    if not KEEP_TRIMMED_CLIP:
+                        try:
+                            os.remove(clip_path)
+                        except Exception:
+                            pass
+
+                except Exception as e:
+                    logger.error(f"{file_str}: download/annotate failed: {e}")
