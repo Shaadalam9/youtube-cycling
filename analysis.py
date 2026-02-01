@@ -48,14 +48,22 @@ TRIMMED_CLIPS_DIR = os.path.join(videos_dir, "trimmed_video")
 # after the annotated video is written successfully.
 KEEP_TRIMMED_CLIP: bool = False
 
+# Annotation controls
+# If True, always draw IDs for ALL detected bicyclists (not only those involved in following episodes).
+ANNOTATE_ALL_BICYCLISTS: bool = True
+# If True, render a text overlay each frame showing active follower->leader pairs.
+ANNOTATE_PAIR_OVERLAY: bool = True
+
+
 # -----------------------------------------------------------------------------
 # ANNOTATION COLORS (BGR)
 # -----------------------------------------------------------------------------
 # follower  : cyclist that is following another cyclist
-# following : cyclist that is being followed (leader in episodes table)
+# leader    : cyclist that is being followed (leader in episodes table)
 # normal    : cyclist that is not in a following episode
 COLOR_CYCLIST_FOLLOWER = (0, 0, 255)   # red
 COLOR_CYCLIST_FOLLOWING = (0, 255, 0)  # green
+COLOR_CYCLIST_LEADER = COLOR_CYCLIST_FOLLOWING  # alias for clarity
 COLOR_CYCLIST_NORMAL = (0, 215, 255)   # orange/yellow-ish (visible on most backgrounds)
 COLOR_BICYCLE = (255, 0, 0)            # blue
 
@@ -345,6 +353,9 @@ class Analysis():
         involved_cyclist_ids: set[int],
         frame_offset: int = 0,
         fps_override: Optional[float] = None,
+        draw_all_bicyclists: bool = True,
+        draw_pair_overlay: bool = True,
+        draw_labels: bool = True,
     ) -> None:
         """
         Create an annotated video for the CSV segment.
@@ -359,10 +370,25 @@ class Analysis():
         """
         os.makedirs(os.path.dirname(output_video_path) or ".", exist_ok=True)
 
-        # Determine cyclists to draw. If no specific involved_cyclist_ids were provided,
-        # annotate ALL bicyclists present in cyclist_map.
-        cyclist_ids: set[int] = set(int(x) for x in involved_cyclist_ids) if involved_cyclist_ids else set()
-        if cyclist_map.height > 0 and not cyclist_ids:
+        # Determine cyclists to draw.
+        # By default, we ALWAYS annotate all bicyclists present in cyclist_map (IDs on screen),
+        # and additionally highlight any 'involved_cyclist_ids' from episodes.
+        cyclist_ids: set[int] = set()
+
+        # 1) Always include all bicyclists (unless explicitly disabled)
+        if draw_all_bicyclists and cyclist_map.height > 0:
+            try:
+                cyclist_ids |= set(int(x) for x in cyclist_map.get_column("cyclist_id").to_list())
+            except Exception:
+                pass
+
+        # 2) Always include involved cyclist IDs (so they get highlighted even if cyclist_map is incomplete)
+        if involved_cyclist_ids:
+            cyclist_ids |= set(int(x) for x in involved_cyclist_ids)
+
+        # Backwards-compatible behavior: if draw_all_bicyclists is False and involved_cyclist_ids is empty,
+        # fall back to annotating ALL bicyclists from cyclist_map.
+        if cyclist_map.height > 0 and (not cyclist_ids):
             try:
                 cyclist_ids = set(int(x) for x in cyclist_map.get_column("cyclist_id").to_list())
             except Exception:
@@ -373,8 +399,7 @@ class Analysis():
         if cyclist_map.height > 0 and cyclist_ids:
             try:
                 bicycle_ids = set(
-                    cyclist_map
-                    .filter(pl.col("cyclist_id").is_in(list(cyclist_ids)))
+                    cyclist_map.filter(pl.col("cyclist_id").is_in(list(cyclist_ids)))
                     .get_column("bicycle_id")
                     .to_list()
                 )
@@ -383,6 +408,15 @@ class Analysis():
                 bicycle_ids = set()
 
         object_ids_to_draw = cyclist_ids | bicycle_ids
+
+        # For nicer labels: bicycle_id -> cyclist_id (rider)
+        bike_to_cyclist: dict[int, int] = {}
+        if cyclist_map.height > 0:
+            try:
+                for r in cyclist_map.select(["bicycle_id", "cyclist_id"]).iter_rows(named=True):
+                    bike_to_cyclist[int(r["bicycle_id"])] = int(r["cyclist_id"])
+            except Exception:
+                bike_to_cyclist = {}
 
         # Pre-index the CSV rows we care about: frame -> list[rows]
         frame_to_rows: dict[int, list[dict]] = {}
@@ -395,31 +429,37 @@ class Analysis():
                 fc = int(row["frame-count"])
                 frame_to_rows.setdefault(fc, []).append(row)
 
-                # CSV bbox coordinates are normalised to [0,1] (YOLO format) in this project.
+        # CSV bbox coordinates are normalised to [0,1] (YOLO format) in this project.
         # We therefore always interpret x-center/y-center/width/height as normalised values.
         coords_normalised = True
 
-# Episode intervals for quick role lookup
+        # Episode intervals for quick role lookup
         intervals: list[tuple[int, int, int, int]] = []
         if episodes.height > 0:
             try:
-                for r in episodes.select(["start_frame",
-                                          "end_frame",
-                                          "follower_id",
-                                          "leader_id"]).iter_rows(named=True):
-                    intervals.append(
-                        (int(r["start_frame"]), int(r["end_frame"]), int(r["follower_id"]), int(r["leader_id"]))
-                    )
+                leader_col = "leader_id" if "leader_id" in episodes.columns else "following_id"
+                for r in episodes.select(["start_frame", "end_frame",
+                                          "follower_id", leader_col]).iter_rows(named=True):
+                    intervals.append((int(r["start_frame"]), int(r["end_frame"]),
+                                      int(r["follower_id"]), int(r[leader_col])))
+
             except Exception:
                 intervals = []
 
-        def roles_for_frame(frame_count: int) -> dict[int, str]:
+        def roles_for_frame(frame_count: int) -> tuple[dict[int, str], dict[int, int]]:
+            """Return (roles, active_pairs) for a given frame.
+
+            roles maps cyclist_id -> {"follower","leader","normal"} (normal implied when absent).
+            active_pairs maps follower_id -> leader_id for pairs active on this frame.
+            """
             roles: dict[int, str] = {}
+            active_pairs: dict[int, int] = {}
             for s, e, fid, lid in intervals:
                 if s <= frame_count <= e:
                     roles[fid] = "follower"
-                    roles[lid] = "following"
-            return roles
+                    roles[lid] = "leader"
+                    active_pairs[fid] = lid
+            return roles, active_pairs
 
         cap = cv2.VideoCapture(input_video_path)
         if not cap.isOpened():
@@ -448,7 +488,7 @@ class Analysis():
                     break
 
                 csv_frame = frame_idx + int(frame_offset)
-                roles = roles_for_frame(csv_frame)
+                roles, active_pairs = roles_for_frame(csv_frame)
 
                 for row in frame_to_rows.get(csv_frame, []):
                     yolo_id = int(row["yolo-id"])
@@ -481,31 +521,60 @@ class Analysis():
                     y1 = max(0, min(height - 1, y1))
                     y2 = max(0, min(height - 1, y2))
 
-                    # Colors: follower (red), following (green), normal (orange), bicycle (blue)
+                    # Colors: follower (red), leader (green), normal (orange), bicycle (blue)
                     if yolo_id == 0:  # cyclist/person
                         role = roles.get(obj_id, "normal")
                         if role == "follower":
                             color = COLOR_CYCLIST_FOLLOWER
-                        elif role == "following":
-                            color = COLOR_CYCLIST_FOLLOWING
+                        elif role == "leader":
+                            color = COLOR_CYCLIST_LEADER
                         else:
                             color = COLOR_CYCLIST_NORMAL
                         label = f"{role}:{obj_id}"
                     else:  # bicycle / other object
                         color = COLOR_BICYCLE
-                        label = f"bicycle:{obj_id}"
+                        rider_id = bike_to_cyclist.get(obj_id)
+                        label = f"bicycle:{obj_id}" if rider_id is None else f"bicycle:{obj_id} rider:{rider_id}"
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(
-                        frame,
-                        label,
-                        (x1, max(0, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        1,
-                        cv2.LINE_AA,
-                    )
+                    if draw_labels:
+
+                        cv2.putText(
+
+                            frame,
+
+                            label,
+
+                            (x1, max(0, y1 - 6)),
+
+                            cv2.FONT_HERSHEY_SIMPLEX,
+
+                            0.5,
+
+                            color,
+
+                            1,
+
+                            cv2.LINE_AA,
+
+                        )
+
+                # Optional overlay: show who is following whom on this frame.
+                if draw_pair_overlay and active_pairs:
+                    y0 = 28
+                    x0 = 12
+                    for idx, (fid, lid) in enumerate(sorted(active_pairs.items())):
+                        txt = f"Follower {fid} -> Leader {lid}"
+                        cv2.putText(
+                            frame,
+                            txt,
+                            (x0, y0 + 18 * idx),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
 
                 out.write(frame)
                 frame_idx += 1
@@ -697,25 +766,33 @@ if __name__ == "__main__":
             video_city, video_state, video_country = place
             logger.info(f"{file_str}: found values {video_city}, {video_state}, {video_country}.")
 
-            cyclist_map = cf.identify_bicyclists(df, min_shared_frames=4, score_thresh=0.0)
+            cyclist_map = cf.identify_bicyclists(df, min_shared_frames=30, score_thresh=0.0)
             states = cf.build_cyclist_states(df, cyclist_map, prefer_vehicle_center=True)
+            fps_csv = float(fps)  # from filename suffix
             episodes = cf.detect_following_episodes(
                 states,
                 params=FollowingParams(
-                    speed_min=0.8,
-                    dir_cos_thresh=0.75,
-                    rel_speed_thresh=0.6,
-                    long_min=0.8,
-                    long_max=10.0,
-                    lat_max=0.9,
+                    speed_min=8e-4,
+                    dir_cos_thresh=0.2,
+                    rel_speed_thresh=0.003,
+                    long_min=0.03,
+                    long_max=0.3,
+                    lat_max=0.1,
                     min_follow_frames=10,
-                    gap_allow=1,
+                    gap_allow=10,
                 ),
-                fps=None,   # set if you know it, e.g. fps=30
+                fps=None,
             )
             print(cyclist_map)
 
             print(episodes)
+
+            # Human-readable summary of unique pairs
+            try:
+                pair_summary = cf.summarize_following_pairs(episodes, fps=fps_csv)
+                print(pair_summary)
+            except Exception:
+                pass
 
             # If enabled, download the source video and generate an annotated video for this CSV segment
             logger.info(f"{file_str}: annotation pipeline triggered (DOWNLOAD_AND_ANNOTATE={DOWNLOAD_AND_ANNOTATE},bicyclists={cyclist_map.height})")  # noqa: E501
@@ -787,6 +864,9 @@ if __name__ == "__main__":
                         involved_cyclist_ids=involved_cyclists,
                         frame_offset=min_frame,
                         fps_override=fps_value,
+                        draw_all_bicyclists=ANNOTATE_ALL_BICYCLISTS,
+                        draw_pair_overlay=ANNOTATE_PAIR_OVERLAY,
+                        draw_labels=True,
                     )
                     logger.info(f"{file_str}: annotated video written to {annotated_path}")
 

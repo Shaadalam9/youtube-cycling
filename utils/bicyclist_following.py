@@ -13,7 +13,8 @@ BICYCLE_CLASS = 1
 @dataclass
 class FollowingParams:
     # Motion / geometry
-    speed_min: float = 0.8          # pixels per frame (tune)
+    speed_min: float = 0.8          # pixels per frame (tune) – see auto-speed logic in detect_following_episodes
+    motion_lag: int = 5             # multi-frame displacement to stabilize direction/speed (>=1)
     dir_cos_thresh: float = 0.75    # direction alignment between follower and leader
     rel_speed_thresh: float = 0.6   # |vL - vF| / vF
 
@@ -25,6 +26,15 @@ class FollowingParams:
     # Persistence
     min_follow_frames: int = 10     # minimum frames to qualify as following episode
     gap_allow: int = 1              # allow up to this many missing frames inside an episode
+
+    # Additional robustness gates (optional but very effective on perspective views)
+    # Require leader to have started earlier than follower by at least this many frames.
+    # If None, a conservative default of 4 * min_follow_frames is used.
+    leader_min_lead_frames: Optional[int] = None
+
+    # Perspective sanity: leader is usually farther away -> smaller bbox height.
+    # Set to None to disable.
+    leader_height_ratio_max: Optional[float] = 0.85
 
     eps: float = 1e-9
 
@@ -62,6 +72,7 @@ class CyclistFollowing:
         score_thresh: float = 0.0,
         person_class: int = PERSON_CLASS,
         bicycle_class: int = BICYCLE_CLASS,
+        enforce_unique_bicycle: bool = True,
     ) -> pl.DataFrame:
         """
         Returns mapping table:
@@ -112,7 +123,17 @@ class CyclistFollowing:
                 }
             )
 
-        return pl.DataFrame(rows)
+        out = pl.DataFrame(rows)
+
+        # Often multiple person tracks latch to the same bicycle track (track fragmentation / ID switches).
+        # Keeping a 1-to-1 mapping reduces duplicate cyclists and downstream false following pairs.
+        if enforce_unique_bicycle and out.height > 0:
+            out = (
+                out.sort(["bicycle_id", "shared_frames", "score"], descending=[False, True, True])
+                   .unique(subset=["bicycle_id"], keep="first")
+            )
+
+        return out
 
     @staticmethod
     def build_cyclist_states(
@@ -122,6 +143,7 @@ class CyclistFollowing:
         prefer_vehicle_center: bool = True,
         person_class: int = PERSON_CLASS,
         bicycle_class: int = BICYCLE_CLASS,
+        motion_lag: int = FollowingParams().motion_lag,
         eps: float = 1e-9,
     ) -> pl.DataFrame:
         """
@@ -138,8 +160,12 @@ class CyclistFollowing:
         # Person detections for cyclist_ids
         p = (
             df.filter(pl.col("yolo-id") == person_class)
-              .join(cyclist_map.select(["cyclist_id"]), left_on="unique-id", right_on="cyclist_id", how="inner")
-              .select(
+              .join(
+                  cyclist_map.select(["cyclist_id"]),
+                  left_on="unique-id",
+                  right_on="cyclist_id",
+                  how="inner",
+              ).select(
                   [
                       pl.col("frame-count"),
                       pl.col("unique-id").alias("cyclist_id"),
@@ -154,12 +180,16 @@ class CyclistFollowing:
         # Bicycle detections for bicycle_ids
         b = (
             df.filter(pl.col("yolo-id") == bicycle_class)
-              .join(cyclist_map.select(["cyclist_id", "bicycle_id"]), left_on="unique-id", right_on="bicycle_id", how="inner")  # noqa: E501
-              .select(
+              .join(
+                  cyclist_map.select(["cyclist_id", "bicycle_id"]),
+                  left_on="unique-id",
+                  right_on="bicycle_id",
+                  how="inner",
+              ).select(
                   [
                       pl.col("frame-count"),
                       pl.col("cyclist_id"),
-                      pl.col("unique-id").alias("bicycle_id"),
+                      pl.col("unique-id").alias("bicycle_id"),  # detected bicycle id (may be missing some frames)
                       pl.col("x-center").alias("bx"),
                       pl.col("y-center").alias("by"),
                       pl.col("width").alias("bw"),
@@ -168,48 +198,67 @@ class CyclistFollowing:
               )
         )
 
-        # Join per frame. If prefer_vehicle_center, use bicycle center when present else person.
+        # Join per frame. Keep both detected bicycle_id and mapped bicycle_id_right for fallback.
         j = (
             p.join(b, on=["frame-count", "cyclist_id"], how="left")
              .join(cyclist_map.select(["cyclist_id", "bicycle_id"]), on="cyclist_id", how="left")
         )
 
         if prefer_vehicle_center:
+            # Use bicycle center when present, else person center
             x = pl.when(pl.col("bx").is_not_null()).then(pl.col("bx")).otherwise(pl.col("px")).alias("x")
             y = pl.when(pl.col("by").is_not_null()).then(pl.col("by")).otherwise(pl.col("py")).alias("y")
-            w = pl.when(pl.col("bw").is_not_null()).then(pl.col("bw")).otherwise(pl.col("pw")).alias("w")
-            h = pl.when(pl.col("bh").is_not_null()).then(pl.col("bh")).otherwise(pl.col("ph")).alias("h")
+
+            # IMPORTANT CHANGE (Option 2):
+            # Always normalize using PERSON size (pw/ph). If person size ever missing, fall back to bicycle size.
+            w = pl.coalesce([pl.col("pw"), pl.col("bw")]).alias("w")
+            h = pl.coalesce([pl.col("ph"), pl.col("bh")]).alias("h")
         else:
-            x, y, w, h = pl.col("px").alias("x"), pl.col("py").alias("y"), pl.col("pw").alias("w"), pl.col("ph").alias("h")  # noqa: E501
+            x = pl.col("px").alias("x")
+            y = pl.col("py").alias("y")
+            w = pl.coalesce([pl.col("pw"), pl.col("bw")]).alias("w")
+            h = pl.coalesce([pl.col("ph"), pl.col("bh")]).alias("h")
+
+        # Stabilize direction using a multi-frame displacement.
+        # NOTE: speed is reported as "per-frame" distance (disp / lag).
+        lag = max(int(motion_lag), 1)
 
         states = (
             j.select(
                 [
                     pl.col("frame-count"),
                     pl.col("cyclist_id"),
-                    pl.col("bicycle_id"),
+
+                    # Prefer detected bicycle_id when present; otherwise use mapped id from cyclist_map join.
+                    pl.coalesce([pl.col("bicycle_id"), pl.col("bicycle_id_right")]).alias("bicycle_id"),
+
                     x, y, w, h,
                 ]
             )
             .sort(["cyclist_id", "frame-count"])
             .with_columns(
                 [
-                    (pl.col("x") - pl.col("x").shift(1)).over("cyclist_id").alias("dx"),
-                    (pl.col("y") - pl.col("y").shift(1)).over("cyclist_id").alias("dy"),
+                    (pl.col("x") - pl.col("x").shift(lag)).over("cyclist_id").alias("dx"),
+                    (pl.col("y") - pl.col("y").shift(lag)).over("cyclist_id").alias("dy"),
                 ]
             )
             .with_columns(
                 [
-                    (pl.col("dx") ** 2 + pl.col("dy") ** 2).sqrt().alias("speed"),
+                    ((pl.col("dx") ** 2 + pl.col("dy") ** 2).sqrt()).alias("disp"),
                 ]
             )
             .with_columns(
                 [
-                    (pl.col("dx") / (pl.col("speed") + eps)).alias("dirx"),
-                    (pl.col("dy") / (pl.col("speed") + eps)).alias("diry"),
+                    (pl.col("disp") / float(lag)).alias("speed"),
                 ]
             )
-            .drop(["dx", "dy"])
+            .with_columns(
+                [
+                    (pl.col("dx") / (pl.col("disp") + eps)).alias("dirx"),
+                    (pl.col("dy") / (pl.col("disp") + eps)).alias("diry"),
+                ]
+            )
+            .drop(["dx", "dy", "disp"])
         )
 
         return states
@@ -228,15 +277,71 @@ class CyclistFollowing:
           follower_id, leader_id, start_frame, end_frame, n_frames,
           mean_long, mean_lat, mean_dist, mean_dir_cos, mean_rel_speed,
           mean_time_headway_frames, mean_time_headway_s (if fps provided)
+
+        Notes on parameter interpretation (auto-mode):
+          - If (long_max <= 1.0 and lat_max <= 1.0): interpret long_min/long_max/lat_max
+            as ABSOLUTE distances in the same coordinate system as x,y (e.g., normalized [0,1]).
+            Otherwise, interpret them in units of follower height (original behavior).
+          - If rel_speed_thresh < 0.05: interpret it as ABSOLUTE |vL - vF| (same units as speed).
+            Otherwise, interpret it as RELATIVE |vL - vF| / max(vL, vF).
         """
+
+        def _empty_episodes_frame() -> pl.DataFrame:
+            schema = {
+                "follower_id": pl.Int64,
+                "leader_id": pl.Int64,
+                "start_frame": pl.Int64,
+                "end_frame": pl.Int64,
+                "n_frames": pl.Int64,
+                "mean_long": pl.Float64,
+                "mean_lat": pl.Float64,
+                "mean_dist": pl.Float64,
+                "mean_dir_cos": pl.Float64,
+                "mean_rel_speed": pl.Float64,
+                "mean_time_headway_frames": pl.Float64,
+            }
+            if fps is not None and fps > 0:
+                schema["mean_time_headway_s"] = pl.Float64
+            return pl.DataFrame(schema=schema)
+
         if states.height == 0:
-            return pl.DataFrame()
+            return _empty_episodes_frame()
+
+        # Track start frame per cyclist (use full states, not speed-filtered states)
+        start_map = {
+            int(cid): int(sf)
+            for cid, sf in states.group_by("cyclist_id").agg(pl.col("frame-count").min()).rows()
+        }
+
+        # If the user did not specify a lead-in, use a conservative default.
+        leader_min_lead_frames = (
+            int(params.leader_min_lead_frames)
+            if params.leader_min_lead_frames is not None
+            else int(4 * params.min_follow_frames)
+        )
+        leader_min_lead_frames = max(int(leader_min_lead_frames), 0)
+
+        # Auto speed_min for normalized coordinates (typical YOLO exports: x/y in [0,1]).
+        speed_min = float(params.speed_min)
+        try:
+            x_max = float(states.select(pl.col("x").max()).to_series()[0])
+            y_max = float(states.select(pl.col("y").max()).to_series()[0])
+            if speed_min > 0.05 and (x_max <= 2.0) and (y_max <= 2.0):
+                # Estimate a reasonable speed threshold from the data.
+                # Use 20% of the median non-null speed, floored to a tiny epsilon.
+                med_speed = float(
+                    states.filter(pl.col("speed").is_not_null())
+                    .select(pl.col("speed").median())
+                    .to_series()[0]
+                )
+                speed_min = max(0.0005, 0.2 * med_speed)
+        except Exception:
+            pass
 
         # Keep only frames where direction is meaningful (speed >= speed_min)
-        s = states.filter(pl.col("speed") >= params.speed_min)
-
+        s = states.filter(pl.col("speed") >= speed_min)
         if s.height == 0:
-            return pl.DataFrame()
+            return _empty_episodes_frame()
 
         frames = (
             s.select("frame-count")
@@ -246,7 +351,14 @@ class CyclistFollowing:
              .to_list()
         )
 
-        # Frame-wise assignments: follower -> leader
+        # Auto-interpret distance thresholds:
+        # - "absolute mode" is typical when x,y are normalized to [0,1] and thresholds are like 0.03, 0.3, 0.1
+        use_abs_dist = (params.long_max <= 1.0) and (params.lat_max <= 1.0)
+
+        # Auto-interpret speed threshold:
+        # - small values (e.g., 0.003) are much more plausible as absolute speed deltas than relative fractions
+        use_abs_speed = (params.rel_speed_thresh < 0.05)
+
         assign_rows: List[dict] = []
 
         for f in frames:
@@ -254,7 +366,6 @@ class CyclistFollowing:
             if sf.height < 2:
                 continue
 
-            # Extract arrays
             follower_ids = sf.get_column("cyclist_id").to_numpy()
             x = sf.get_column("x").to_numpy()
             y = sf.get_column("y").to_numpy()
@@ -263,38 +374,70 @@ class CyclistFollowing:
             dirx = sf.get_column("dirx").to_numpy()
             diry = sf.get_column("diry").to_numpy()
 
-            # For direction similarity between i and j: cos = di · dj
-            # Precompute dir matrix components
             for i in range(sf.height):
-                di = np.array([dirx[i], diry[i]], dtype=float)
-                if not np.isfinite(di).all():
+                di0 = float(dirx[i])
+                di1 = float(diry[i])
+                if not np.isfinite(di0) or not np.isfinite(di1):
                     continue
 
-                # relative vectors to all others
                 rx = x - x[i]
                 ry = y - y[i]
                 dist = np.sqrt(rx * rx + ry * ry)
 
-                # follower i forward axis
-                longi = rx * di[0] + ry * di[1]
-                lati = np.abs(rx * di[1] - ry * di[0])  # |cross(rel, dir)| in 2D
+                longi = rx * di0 + ry * di1
+                lati = np.abs(rx * di1 - ry * di0)  # |cross(rel, dir)| in 2D
 
-                # direction cosine between i and each j
-                cos_dir = dirx * di[0] + diry * di[1]
+                cos_dir = dirx * di0 + diry * di1
 
-                # relative speed
-                rel_sp = np.abs(sp - sp[i]) / max(sp[i], params.eps)
+                # Speed difference gate (auto-mode)
+                abs_sp_diff = np.abs(sp - sp[i])
+                if use_abs_speed:
+                    speed_metric = abs_sp_diff
+                    speed_ok = abs_sp_diff <= params.rel_speed_thresh
+                else:
+                    denom = np.maximum.reduce([sp, np.full_like(sp, sp[i]), np.full_like(sp, params.eps)])
+                    speed_metric = abs_sp_diff / denom
+                    speed_ok = speed_metric <= params.rel_speed_thresh
 
-                size_i = max(float(h[i]), params.eps)
+                # Distance gates (auto-mode)
+                if use_abs_dist:
+                    dist_ok = (
+                        (longi >= params.long_min) &
+                        (longi <= params.long_max) &
+                        (lati <= params.lat_max)
+                    )
+                    size_i = 1.0  # only for bookkeeping; not used in gating
+                else:
+                    size_i = max(float(h[i]), params.eps)
+                    dist_ok = (
+                        (longi >= params.long_min * size_i) &
+                        (longi <= params.long_max * size_i) &
+                        (lati <= params.lat_max * size_i)
+                    )
 
                 cand = (
                     (follower_ids != follower_ids[i]) &
                     (cos_dir >= params.dir_cos_thresh) &
-                    (longi >= params.long_min * size_i) &
-                    (longi <= params.long_max * size_i) &
-                    (lati <= params.lat_max * size_i) &
-                    (rel_sp <= params.rel_speed_thresh)
+                    dist_ok &
+                    speed_ok
                 )
+
+                # Optional: leader must start sufficiently earlier than follower
+                if leader_min_lead_frames > 0:
+                    f_start = start_map.get(int(follower_ids[i]), 0)
+                    lead_ok = np.array(
+                        [
+                            start_map.get(int(lid), 0) <= (f_start - leader_min_lead_frames)
+                            for lid in follower_ids
+                        ],
+                        dtype=bool,
+                    )
+                    cand = cand & lead_ok
+
+                # Optional: perspective sanity (leader bbox smaller than follower bbox)
+                if params.leader_height_ratio_max is not None:
+                    ratio = h / max(float(h[i]), params.eps)
+                    cand = cand & (ratio <= float(params.leader_height_ratio_max))
 
                 if not np.any(cand):
                     continue
@@ -303,7 +446,6 @@ class CyclistFollowing:
                 cand_idx = np.where(cand)[0]
                 j_best = cand_idx[np.argmin(longi[cand_idx])]
 
-                # time headway in frames: longitudinal gap / follower speed
                 thw_frames = float(longi[j_best] / max(sp[i], params.eps))
 
                 assign_rows.append(
@@ -315,19 +457,21 @@ class CyclistFollowing:
                         "lat_gap": float(lati[j_best]),
                         "dist": float(dist[j_best]),
                         "dir_cos": float(cos_dir[j_best]),
-                        "rel_speed": float(rel_sp[j_best]),
+                        # keep column name for compatibility; metric depends on auto-mode
+                        "rel_speed": float(speed_metric[j_best]),
                         "thw_frames": thw_frames,
                     }
                 )
 
         if not assign_rows:
-            return pl.DataFrame()
+            return _empty_episodes_frame()
 
         assigns = pl.DataFrame(assign_rows).sort(["follower_id", "frame-count"])
 
-        # Merge into episodes per follower where leader stays constant and frames are consecutive (allowing small gaps)
         episodes: List[dict] = []
-        for follower_id, g in assigns.group_by("follower_id", maintain_order=True):
+        for follower_key, g in assigns.group_by("follower_id", maintain_order=True):
+            follower_id = follower_key[0] if isinstance(follower_key, tuple) else follower_key
+
             g = g.sort("frame-count")
             frames_g = g.get_column("frame-count").to_numpy()
             leaders_g = g.get_column("leader_id").to_numpy()
@@ -357,7 +501,7 @@ class CyclistFollowing:
                         seg_frames = frames_g[seg_slice]
                         episodes.append(
                             {
-                                "follower_id": int(follower_id),  # type: ignore
+                                "follower_id": int(follower_id),
                                 "leader_id": leader,
                                 "start_frame": int(seg_frames[0]),
                                 "end_frame": int(seg_frames[-1]),
@@ -372,10 +516,15 @@ class CyclistFollowing:
                         )
                     start = k
 
+        if not episodes:
+            return _empty_episodes_frame()
+
         ep = pl.DataFrame(episodes).sort(["start_frame", "follower_id", "leader_id"])
 
-        if ep.height == 0:
-            return ep
+        # Convenience label for quick inspection
+        ep = ep.with_columns(
+            (pl.col("follower_id").cast(pl.Utf8) + pl.lit("->") + pl.col("leader_id").cast(pl.Utf8)).alias("pair")
+        )
 
         if fps is not None and fps > 0:
             ep = ep.with_columns(
@@ -383,3 +532,80 @@ class CyclistFollowing:
             )
 
         return ep
+
+    @staticmethod
+    def summarize_following_pairs(
+        episodes: pl.DataFrame,
+        *,
+        fps: Optional[float] = None,
+    ) -> pl.DataFrame:
+        """
+        Summarize detected following relationships as unique (follower_id -> leader_id) pairs.
+
+        Returns a table with:
+          follower_id, leader_id, pair, n_episodes, total_frames,
+          first_start_frame, last_end_frame, total_seconds (if fps provided),
+          w_mean_long, w_mean_lat, w_mean_dist, w_mean_dir_cos, w_mean_rel_speed, w_mean_time_headway_frames,
+          w_mean_time_headway_s (if fps provided)
+
+        Weighted means are weighted by episode length (n_frames).
+        """
+        if episodes is None or episodes.height == 0:
+            out = pl.DataFrame(
+                {
+                    "follower_id": pl.Series([], dtype=pl.Int64),
+                    "leader_id": pl.Series([], dtype=pl.Int64),
+                    "pair": pl.Series([], dtype=pl.Utf8),
+                    "n_episodes": pl.Series([], dtype=pl.Int64),
+                    "total_frames": pl.Series([], dtype=pl.Int64),
+                    "first_start_frame": pl.Series([], dtype=pl.Int64),
+                    "last_end_frame": pl.Series([], dtype=pl.Int64),
+                }
+            )
+            if fps is not None and fps > 0:
+                out = out.with_columns(pl.Series([], dtype=pl.Float64).alias("total_seconds"))
+            return out
+
+        # Ensure expected columns exist
+        required = {"follower_id", "leader_id", "start_frame", "end_frame", "n_frames"}
+        missing = required - set(episodes.columns)
+        if missing:
+            raise ValueError(f"episodes is missing required columns: {sorted(missing)}")
+
+        # Weighted means (by n_frames) for useful diagnostics
+        def wmean(col: str) -> pl.Expr:
+            if col not in episodes.columns:
+                return pl.lit(None).cast(pl.Float64).alias(f"w_{col}")
+            return (pl.sum(pl.col(col) * pl.col("n_frames")) / pl.sum("n_frames")).alias(f"w_{col}")  # type: ignore
+
+        agg = (
+            episodes.group_by(["follower_id", "leader_id"])
+            .agg(
+                [
+                    pl.count().alias("n_episodes"),
+                    pl.sum("n_frames").alias("total_frames"),
+                    pl.min("start_frame").alias("first_start_frame"),
+                    pl.max("end_frame").alias("last_end_frame"),
+                    wmean("mean_long"),
+                    wmean("mean_lat"),
+                    wmean("mean_dist"),
+                    wmean("mean_dir_cos"),
+                    wmean("mean_rel_speed"),
+                    wmean("mean_time_headway_frames"),
+                ]
+            )
+            .with_columns(
+                (pl.col("follower_id").cast(pl.Utf8) + pl.lit("->") + pl.col("leader_id").cast(pl.Utf8)).alias("pair")
+            )
+            .sort("total_frames", descending=True)
+        )
+
+        if fps is not None and fps > 0:
+            agg = agg.with_columns((pl.col("total_frames") / float(fps)).alias("total_seconds"))
+            # If we have weighted THW in frames, also provide seconds.
+            if "w_mean_time_headway_frames" in agg.columns:
+                agg = agg.with_columns(
+                    (pl.col("w_mean_time_headway_frames") / float(fps)).alias("w_mean_time_headway_s")
+                )
+
+        return agg
