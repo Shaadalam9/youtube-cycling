@@ -102,15 +102,29 @@ source .venv/bin/activate
 
 **Step 9:** Run the code:
 ```command line
-python3 main.py
+python3 analysis.py
 ```
 
 ### Configuration of project
 Configuration of the project needs to be defined in `config`. Please use the `default.config` file for the required structure of the file. If no custom config file is provided, `default.config` is used. The config file has the following parameters:
-- **`data`**: Directory containing data (CSV output from YOLO).
-- **`videos`**: Directories containing the videos used to generate the data.
 - **`mapping`**: CSV file that contains mapping data for the cities referenced in the data.
+- **`data`**: List of directories containing data (CSV output from YOLO).
+- **`videos`**: Directory containing the videos used to generate the data.
 - **`always_analyse`**: Always conduct analysis even when pickle files are present (good for testing).
 - **`min_confidence`**: Sets the confidence threshold parameter for YOLO.
+- **`countries_analyse`**: List of countries to include in the analysis. If empty, all countries are analysed.
+- **`vehicles_analyse`**: List of YOLO class IDs to include in the analysis (e.g., `[0]`). If empty, all configured classes are analysed.
+- **`DOWNLOAD_AND_ANNOTATE`**: If `true`, downloads (if needed) and generates annotated videos for relevant segments.
+- **`KEEP_TRIMMED_CLIP`**: If `true`, keeps the intermediate trimmed clip on disk; otherwise it is deleted after the annotated video is written.
+- **`ANNOTATE_ALL_BICYCLISTS`**: If `true`, always draw IDs for all detected bicyclists (not only those involved in following episodes).
+- **`ANNOTATE_PAIR_OVERLAY`**: If `true`, overlays active follower → leader pair text on the video.
+- **`CROP_AROUND_FOLLOWING`**: If `true`, when cycle-following is detected, outputs cropped annotated clips around each follower → leader pair.
+- **`CROP_PRE_SECONDS`**: Number of seconds to include before the first encounter of the follower/leader pair.
+- **`CROP_POST_GONE_SECONDS`**: Number of seconds to include after both follower and leader have disappeared from the frame.
+- **`ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING`**: If `true`, also writes the full-segment annotated video in addition to the cropped clips.
+- **`ANNOTATE_WHOLE_SEGMENT`**: If `true`, generates an annotated video for the **entire** CSV segment (download → trim to segment → annotate), regardless of whether cycle-following is detected. If used together with `CROP_AROUND_FOLLOWING=true`, the pipeline can output both full-segment annotated videos (for all segments) and cropped following clips (only for segments where following is detected).
+- **`logger_level`**: Level of console output. Can be: debug, info, warning, error.
 - **`font_family`**: Specifies the font family to be used in outputs.
 - **`font_size`**: Specifies the font size to be used in outputs.
+- **`plotly_template`**: Plotly template to use for figures (e.g., `plotly_white`).
+- **`ftp_server`**: Base URL of the remote file server used to retrieve videos for annotation.

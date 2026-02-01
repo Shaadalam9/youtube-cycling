@@ -1,6 +1,8 @@
 from tqdm import tqdm
 from typing import Optional, Set
+import math
 from custom_logger import CustomLogger
+from logmod import logs
 from urllib.parse import urljoin, urlparse
 from moviepy.video.io.VideoFileClip import VideoFileClip  # type: ignore
 import requests
@@ -28,15 +30,33 @@ geo = Geo()
 MISC_FILES: Set[str] = {"DS_Store"}
 
 
+logs(show_level=common.get_configs("logger_level"), show_color=True)
 logger = CustomLogger(__name__)  # use custom logger
+
 
 # -----------------------------------------------------------------------------
 # USER PARAMETERS (edit these variables; no argparse / no CLI parser is used)
 # -----------------------------------------------------------------------------
+def _cfg_bool(key: str, default: bool) -> bool:
+    """Best-effort boolean config lookup with a safe fallback."""
+    try:
+        return bool(common.get_configs(key))
+    except Exception:
+        return default
+
+
+def _cfg_float(key: str, default: float) -> float:
+    """Best-effort float config lookup with a safe fallback."""
+    try:
+        return float(common.get_configs(key))
+    except Exception:
+        return default
+
+
 # When True: if cyclist-following episodes are detected in a CSV, the script will
 # download the corresponding source video and generate an annotated video showing
 # the involved cyclists (and their bicycles) across the entire CSV segment.
-DOWNLOAD_AND_ANNOTATE: bool = True
+DOWNLOAD_AND_ANNOTATE: bool = _cfg_bool("DOWNLOAD_AND_ANNOTATE", True)
 
 # Output folders
 videos_dir: str = common.get_configs("videos")
@@ -46,13 +66,30 @@ TRIMMED_CLIPS_DIR = os.path.join(videos_dir, "trimmed_video")
 
 # If True, keep the intermediate trimmed clip on disk. If False, it will be deleted
 # after the annotated video is written successfully.
-KEEP_TRIMMED_CLIP: bool = False
+KEEP_TRIMMED_CLIP: bool = _cfg_bool("KEEP_TRIMMED_CLIP", False)
 
 # Annotation controls
 # If True, always draw IDs for ALL detected bicyclists (not only those involved in following episodes).
-ANNOTATE_ALL_BICYCLISTS: bool = True
+ANNOTATE_ALL_BICYCLISTS: bool = _cfg_bool("ANNOTATE_ALL_BICYCLISTS", True)
 # If True, render a text overlay each frame showing active follower->leader pairs.
-ANNOTATE_PAIR_OVERLAY: bool = True
+ANNOTATE_PAIR_OVERLAY: bool = _cfg_bool("ANNOTATE_PAIR_OVERLAY", True)
+# If True, always write a full-segment annotated video for each CSV segment that has bicyclists,
+# regardless of whether a following episode is detected. Cropped clips (if enabled) are still
+# produced only when following exists.
+ANNOTATE_WHOLE_SEGMENT: bool = _cfg_bool("ANNOTATE_WHOLE_SEGMENT", False)
+
+
+# Cropping controls (optional)
+# If True: when following episodes exist, write cropped annotated clips around each follower->leader pair.
+# Crop window definition:
+#   - start: CROP_PRE_SECONDS before the first encounter (episode start_frame)
+#   - end  : CROP_POST_GONE_SECONDS after BOTH leader and follower have disappeared from the frame
+#           (within the CSV segment; clamped to segment bounds).
+CROP_AROUND_FOLLOWING: bool = False
+CROP_PRE_SECONDS: float = _cfg_float("CROP_PRE_SECONDS", 5.0)
+CROP_POST_GONE_SECONDS: float = _cfg_float("CROP_POST_GONE_SECONDS", 6.0)
+# If True and CROP_AROUND_FOLLOWING is enabled, also write the full-segment annotated video.
+ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING: bool = _cfg_bool("ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING", False)
 
 
 # -----------------------------------------------------------------------------
@@ -783,20 +820,28 @@ if __name__ == "__main__":
                 ),
                 fps=None,
             )
-            print(cyclist_map)
+            logger.info(str(cyclist_map))
 
-            print(episodes)
+            logger.info(str(episodes))
 
             # Human-readable summary of unique pairs
             try:
                 pair_summary = cf.summarize_following_pairs(episodes, fps=fps_csv)
-                print(pair_summary)
+                logger.info(str(pair_summary))
             except Exception:
                 pass
 
             # If enabled, download the source video and generate an annotated video for this CSV segment
             logger.info(f"{file_str}: annotation pipeline triggered (DOWNLOAD_AND_ANNOTATE={DOWNLOAD_AND_ANNOTATE},bicyclists={cyclist_map.height})")  # noqa: E501
-            if DOWNLOAD_AND_ANNOTATE and cyclist_map.height > 0:
+            should_annotate = bool(DOWNLOAD_AND_ANNOTATE) and (cyclist_map.height > 0)
+
+            # If cropping is enabled and we're NOT writing full segments, only process segments where following exists.
+
+            if CROP_AROUND_FOLLOWING and (not ANNOTATE_WHOLE_SEGMENT):
+
+                should_annotate = should_annotate and (episodes.height > 0)
+
+            if should_annotate:
                 try:
                     involved_cyclists: set[int] = set()
                     if "follower_id" in episodes.columns:
@@ -843,38 +888,152 @@ if __name__ == "__main__":
                     duration_seconds = (n_frames / fps_value) if fps_value > 0 else 0.0
                     end_seconds = start_seconds + duration_seconds
 
-                    # Trim to the CSV segment, then annotate the whole segment
+                    # Decide which window(s) to annotate
                     os.makedirs(TRIMMED_CLIPS_DIR, exist_ok=True)
-                    clip_path = os.path.join(TRIMMED_CLIPS_DIR, f"{filename_no_ext}.mp4")
-                    analysis.trim_video(local_video_path, clip_path, start_seconds, end_seconds)
-
                     os.makedirs(ANNOTATED_VIDEOS_DIR, exist_ok=True)
-                    annotated_suffix = "following_annotated" if episodes.height > 0 else "annotated"
 
-                    annotated_path = os.path.join(
-                        ANNOTATED_VIDEOS_DIR, f"{filename_no_ext}_{annotated_suffix}.mp4"
-                    )
+                    jobs: list[dict] = []
 
-                    analysis.annotate_following_segment(
-                        input_video_path=clip_path,
-                        output_video_path=annotated_path,
-                        df=df,
-                        cyclist_map=cyclist_map,
-                        episodes=episodes,
-                        involved_cyclist_ids=involved_cyclists,
-                        frame_offset=min_frame,
-                        fps_override=fps_value,
-                        draw_all_bicyclists=ANNOTATE_ALL_BICYCLISTS,
-                        draw_pair_overlay=ANNOTATE_PAIR_OVERLAY,
-                        draw_labels=True,
-                    )
-                    logger.info(f"{file_str}: annotated video written to {annotated_path}")
+                    def _add_job(*, clip_start_s: float, clip_end_s: float, frame_offset: int,
+                                 clip_name: str, annotated_name: str) -> None:
+                        jobs.append({
+                            'clip_start_s': float(clip_start_s),
+                            'clip_end_s': float(clip_end_s),
+                            'frame_offset': int(frame_offset),
+                            'clip_name': str(clip_name),
+                            'annotated_name': str(annotated_name),
+                        })
 
-                    if not KEEP_TRIMMED_CLIP:
+                    # Default (full CSV segment) job definition
+                    full_annotated_suffix = 'following_annotated' if episodes.height > 0 else 'annotated'
+                    full_clip_name = f"{filename_no_ext}.mp4"
+                    full_annotated_name = f"{filename_no_ext}_{full_annotated_suffix}.mp4"
+
+                    if CROP_AROUND_FOLLOWING and episodes.height > 0:
+                        # Produce a cropped annotated clip per detected follower->leader pair.
+                        pre_frames = int(math.ceil(CROP_PRE_SECONDS * fps_value))
+                        post_frames = int(math.ceil(CROP_POST_GONE_SECONDS * fps_value))
+
                         try:
-                            os.remove(clip_path)
+                            pairs = episodes.select(['follower_id', 'leader_id']).unique()
                         except Exception:
-                            pass
+                            pairs = pl.DataFrame(schema={'follower_id': pl.Int64, 'leader_id': pl.Int64})
+
+                        for fid, lid in pairs.select(['follower_id', 'leader_id']).iter_rows():
+                            fid_i = int(fid)
+                            lid_i = int(lid)
+
+                            pair_eps = episodes.filter((pl.col('follower_id') == fid_i
+                                                        ) & (pl.col('leader_id') == lid_i))
+                            if pair_eps.height == 0:
+                                continue
+
+                            # 1) First encounter = first start_frame for this pair.
+                            try:
+                                first_encounter = int(pair_eps.select(pl.min('start_frame')).item())
+                            except Exception:
+                                continue
+
+                            # 2) 'Gone' = first frame AFTER the last time either cyclist appears (based on states).
+                            try:
+                                last_f = states.filter(pl.col('cyclist_id') == fid_i
+                                                       ).select(pl.max('frame-count')).item()
+                            except Exception:
+                                last_f = None
+                            try:
+                                last_l = states.filter(pl.col('cyclist_id') == lid_i
+                                                       ).select(pl.max('frame-count')).item()
+                            except Exception:
+                                last_l = None
+
+                            try:
+                                fallback_last = int(pair_eps.select(pl.max('end_frame')).item())
+                            except Exception:
+                                fallback_last = first_encounter
+
+                            last_frames: list[int] = []
+                            for v in (last_f, last_l):
+                                if v is not None:
+                                    try:
+                                        last_frames.append(int(v))
+                                    except Exception:
+                                        pass
+                            last_any = max(last_frames + [int(fallback_last)]) if last_frames else int(fallback_last)
+                            gone_frame = min(max_frame + 1, int(last_any) + 1)
+
+                            crop_start_frame = max(min_frame, int(first_encounter) - pre_frames)
+                            crop_end_frame = min(max_frame, int(gone_frame) + post_frames)
+
+                            # Ensure at least ~1 second of output (VideoFileClip can error on empty subclips).
+                            if crop_end_frame <= crop_start_frame:
+                                crop_end_frame = min(max_frame, crop_start_frame + max(1, int(math.ceil(fps_value))))
+
+                            clip_start_s = float(start_seconds) + float(
+                                crop_start_frame - min_frame) / float(fps_value)
+                            # +1 frame so we include crop_end_frame (match how end_seconds
+                            #                                           is computed for the full segment).
+                            clip_end_s = float(start_seconds) + float(
+                                crop_end_frame - min_frame + 1) / float(fps_value)
+
+                            clip_name = f"{filename_no_ext}_f{fid_i}_l{lid_i}_crop.mp4"
+                            annotated_name = f"{filename_no_ext}_f{fid_i}_l{lid_i}_following_crop_annotated.mp4"
+                            _add_job(
+                                clip_start_s=clip_start_s,
+                                clip_end_s=clip_end_s,
+                                frame_offset=crop_start_frame,
+                                clip_name=clip_name,
+                                annotated_name=annotated_name,
+                            )
+                            logger.info(
+                                f"{file_str}: crop window for follower {fid_i} -> leader {lid_i}: "
+                                f"frames [{crop_start_frame}, {crop_end_frame}] "
+                                f"(t=[{clip_start_s:.2f}s, {clip_end_s:.2f}s])"
+                            )
+
+                        if ANNOTATE_WHOLE_SEGMENT or ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING or (not jobs):
+                            _add_job(
+                                clip_start_s=float(start_seconds),
+                                clip_end_s=float(end_seconds),
+                                frame_offset=int(min_frame),
+                                clip_name=full_clip_name,
+                                annotated_name=full_annotated_name,
+                            )
+                    else:
+                        # Default behavior: annotate the full CSV segment.
+                        _add_job(
+                            clip_start_s=float(start_seconds),
+                            clip_end_s=float(end_seconds),
+                            frame_offset=int(min_frame),
+                            clip_name=full_clip_name,
+                            annotated_name=full_annotated_name,
+                        )
+
+                    # Execute jobs
+                    for job in jobs:
+                        clip_path = os.path.join(TRIMMED_CLIPS_DIR, job['clip_name'])
+                        annotated_path = os.path.join(ANNOTATED_VIDEOS_DIR, job['annotated_name'])
+
+                        analysis.trim_video(local_video_path, clip_path, job['clip_start_s'], job['clip_end_s'])
+                        analysis.annotate_following_segment(
+                            input_video_path=clip_path,
+                            output_video_path=annotated_path,
+                            df=df,
+                            cyclist_map=cyclist_map,
+                            episodes=episodes,
+                            involved_cyclist_ids=involved_cyclists,
+                            frame_offset=int(job['frame_offset']),
+                            fps_override=fps_value,
+                            draw_all_bicyclists=ANNOTATE_ALL_BICYCLISTS,
+                            draw_pair_overlay=ANNOTATE_PAIR_OVERLAY,
+                            draw_labels=True,
+                        )
+                        logger.info(f"{file_str}: annotated video written to {annotated_path}")
+
+                        if not KEEP_TRIMMED_CLIP:
+                            try:
+                                os.remove(clip_path)
+                            except Exception:
+                                pass
 
                 except Exception as e:
                     logger.error(f"{file_str}: download/annotate failed: {e}")
