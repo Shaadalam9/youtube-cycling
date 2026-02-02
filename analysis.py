@@ -747,6 +747,13 @@ if __name__ == "__main__":
     )
 
     df_mapping = pl.read_csv(common.get_configs("mapping"))
+
+    countries_analyse: list[str] = common.get_configs("countries_analyse")
+
+    if countries_analyse:  # non-empty -> filter
+        df_mapping = df_mapping.filter(pl.col("iso3").is_in(countries_analyse))
+    # else: empty -> do nothing (keep all rows)
+
     min_conf = common.get_configs("min_confidence")
 
     # Precompute fast lookup once (place this immediately before the loops)
