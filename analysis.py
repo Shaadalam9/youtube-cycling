@@ -917,7 +917,7 @@ if __name__ == "__main__":
                     # IMPORTANT: frame-count is absolute within the segment; min_frame can be >0 simply
                     # because early frames had no detections. Clip timing must be based on the actual
                     # frame indices, not (max-min+1) starting at t=0.
-                    end_seconds = float(start_seconds) + (float(max_frame + 1) / float(fps_value)) if fps_value > 0 else float(start_seconds)
+                    end_seconds = float(start_seconds) + (float(max_frame + 1) / float(fps_value)) if fps_value > 0 else float(start_seconds)  # noqa: E501
 
                     # Decide which window(s) to annotate
                     os.makedirs(TRIMMED_CLIPS_DIR, exist_ok=True)
@@ -1021,7 +1021,7 @@ if __name__ == "__main__":
 
                         if ANNOTATE_WHOLE_SEGMENT or ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING or (not jobs):
                             _add_job(
-                                clip_start_s=float(start_seconds) + (float(min_frame) / float(fps_value) if fps_value > 0 else 0.0),
+                                clip_start_s=float(start_seconds) + (float(min_frame) / float(fps_value) if fps_value > 0 else 0.0),  # noqa: E501
                                 clip_end_s=float(end_seconds),
                                 frame_offset=int(min_frame),
                                 clip_name=full_clip_name,
@@ -1030,9 +1030,9 @@ if __name__ == "__main__":
                     else:
                         # Default behavior: annotate the full CSV segment.
                         _add_job(
-                            clip_start_s=float(start_seconds) + (float(min_frame) / float(fps_value) if fps_value > 0 else 0.0),
-                                clip_end_s=float(end_seconds),
-                                frame_offset=int(min_frame),
+                            clip_start_s=float(start_seconds) + (float(min_frame) / float(fps_value) if fps_value > 0 else 0.0),  # noqa: E501
+                            clip_end_s=float(end_seconds),
+                            frame_offset=int(min_frame),
                             clip_name=full_clip_name,
                             annotated_name=full_annotated_name,
                         )
