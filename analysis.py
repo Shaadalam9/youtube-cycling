@@ -914,9 +914,10 @@ if __name__ == "__main__":
 
                     min_frame = int(df.select(pl.min("frame-count")).item()) if df.height > 0 else 0
                     max_frame = int(df.select(pl.max("frame-count")).item()) if df.height > 0 else 0
-                    n_frames = max(0, (max_frame - min_frame + 1))
-                    duration_seconds = (n_frames / fps_value) if fps_value > 0 else 0.0
-                    end_seconds = start_seconds + duration_seconds
+                    # IMPORTANT: frame-count is absolute within the segment; min_frame can be >0 simply
+                    # because early frames had no detections. Clip timing must be based on the actual
+                    # frame indices, not (max-min+1) starting at t=0.
+                    end_seconds = float(start_seconds) + (float(max_frame + 1) / float(fps_value)) if fps_value > 0 else float(start_seconds)
 
                     # Decide which window(s) to annotate
                     os.makedirs(TRIMMED_CLIPS_DIR, exist_ok=True)
@@ -998,12 +999,10 @@ if __name__ == "__main__":
                             if crop_end_frame <= crop_start_frame:
                                 crop_end_frame = min(max_frame, crop_start_frame + max(1, int(math.ceil(fps_value))))
 
-                            clip_start_s = float(start_seconds) + float(
-                                crop_start_frame - min_frame) / float(fps_value)
-                            # +1 frame so we include crop_end_frame (match how end_seconds
-                            #                                           is computed for the full segment).
-                            clip_end_s = float(start_seconds) + float(
-                                crop_end_frame - min_frame + 1) / float(fps_value)
+                            clip_start_s = float(start_seconds) + float(crop_start_frame) / float(fps_value)
+
+                            # +1 frame so we include crop_end_frame
+                            clip_end_s = float(start_seconds) + float(crop_end_frame + 1) / float(fps_value)
 
                             clip_name = f"{filename_no_ext}_f{fid_i}_l{lid_i}_crop.mp4"
                             annotated_name = f"{filename_no_ext}_f{fid_i}_l{lid_i}_following_crop_annotated.mp4"
@@ -1022,7 +1021,7 @@ if __name__ == "__main__":
 
                         if ANNOTATE_WHOLE_SEGMENT or ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING or (not jobs):
                             _add_job(
-                                clip_start_s=float(start_seconds),
+                                clip_start_s=float(start_seconds) + (float(min_frame) / float(fps_value) if fps_value > 0 else 0.0),
                                 clip_end_s=float(end_seconds),
                                 frame_offset=int(min_frame),
                                 clip_name=full_clip_name,
@@ -1031,9 +1030,9 @@ if __name__ == "__main__":
                     else:
                         # Default behavior: annotate the full CSV segment.
                         _add_job(
-                            clip_start_s=float(start_seconds),
-                            clip_end_s=float(end_seconds),
-                            frame_offset=int(min_frame),
+                            clip_start_s=float(start_seconds) + (float(min_frame) / float(fps_value) if fps_value > 0 else 0.0),
+                                clip_end_s=float(end_seconds),
+                                frame_offset=int(min_frame),
                             clip_name=full_clip_name,
                             annotated_name=full_annotated_name,
                         )
