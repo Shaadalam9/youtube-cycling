@@ -85,7 +85,7 @@ ANNOTATE_WHOLE_SEGMENT: bool = _cfg_bool("ANNOTATE_WHOLE_SEGMENT", False)
 #   - start: CROP_PRE_SECONDS before the first encounter (episode start_frame)
 #   - end  : CROP_POST_GONE_SECONDS after BOTH leader and follower have disappeared from the frame
 #           (within the CSV segment; clamped to segment bounds).
-CROP_AROUND_FOLLOWING: bool = False
+CROP_AROUND_FOLLOWING: bool = _cfg_bool("CROP_AROUND_FOLLOWING", False)
 CROP_PRE_SECONDS: float = _cfg_float("CROP_PRE_SECONDS", 5.0)
 CROP_POST_GONE_SECONDS: float = _cfg_float("CROP_POST_GONE_SECONDS", 6.0)
 # If True and CROP_AROUND_FOLLOWING is enabled, also write the full-segment annotated video.
@@ -395,67 +395,108 @@ class Analysis():
         draw_labels: bool = True,
     ) -> None:
         """
-        Create an annotated video for the CSV segment.
+        Render an annotated video for a CSV segment.
 
-        - Reads frames from input_video_path.
-        - Draws bounding boxes for involved cyclists (yolo-id=0) and their bicycles (yolo-id=1).
-        - If a frame is within an episode interval, labels cyclists as follower/leader.
-
-        Notes:
-        - Output is written WITHOUT audio (OpenCV VideoWriter).
-        - frame_offset is used if CSV frame-count does not start at 0.
+        - Reads frames from `input_video_path`.
+        - Draws bboxes for cyclists (yolo-id==0) and bicycles (yolo-id!=0, typically 1)
+          for the IDs selected from `cyclist_map` and/or `involved_cyclist_ids`.
+        - If `episodes` contains intervals, cyclists are labelled as follower/leader when active.
+        - Writes output WITHOUT audio via OpenCV VideoWriter.
+        - `frame_offset` aligns video frame index -> CSV frame-count.
         """
-        os.makedirs(os.path.dirname(output_video_path) or ".", exist_ok=True)
+        out_dir = os.path.dirname(output_video_path) or "."
+        os.makedirs(out_dir, exist_ok=True)
 
-        # Determine cyclists to draw.
-        # By default, we ALWAYS annotate all bicyclists present in cyclist_map (IDs on screen),
-        # and additionally highlight any 'involved_cyclist_ids' from episodes.
+        # -----------------------------
+        # Defensive column checks
+        # -----------------------------
+        required_df_cols = {"frame-count", "yolo-id", "unique-id", "x-center", "y-center", "width", "height"}
+        missing_df_cols = required_df_cols - set(df.columns)
+        if missing_df_cols:
+            raise ValueError(f"df is missing required columns: {sorted(missing_df_cols)}")
+
+        # cyclist_map is optional-ish, but if present we expect these cols
+        has_cyclist_map = cyclist_map is not None and cyclist_map.height > 0
+        cyclist_map_has_cols = has_cyclist_map and {"cyclist_id", "bicycle_id"}.issubset(set(cyclist_map.columns))
+
+        # -----------------------------
+        # Select which IDs to draw
+        # -----------------------------
         cyclist_ids: set[int] = set()
 
-        # 1) Always include all bicyclists (unless explicitly disabled)
-        if draw_all_bicyclists and cyclist_map.height > 0:
-            try:
-                cyclist_ids |= set(int(x) for x in cyclist_map.get_column("cyclist_id").to_list())
-            except Exception:
-                pass
+        if draw_all_bicyclists and cyclist_map_has_cols:
+            cyclist_ids |= set(map(int, cyclist_map.get_column("cyclist_id").to_list()))
 
-        # 2) Always include involved cyclist IDs (so they get highlighted even if cyclist_map is incomplete)
         if involved_cyclist_ids:
-            cyclist_ids |= set(int(x) for x in involved_cyclist_ids)
+            cyclist_ids |= set(map(int, involved_cyclist_ids))
 
-        # Backwards-compatible behavior: if draw_all_bicyclists is False and involved_cyclist_ids is empty,
-        # fall back to annotating ALL bicyclists from cyclist_map.
-        if cyclist_map.height > 0 and (not cyclist_ids):
-            try:
-                cyclist_ids = set(int(x) for x in cyclist_map.get_column("cyclist_id").to_list())
-            except Exception:
-                cyclist_ids = set()
+        # If we ended up with nothing but cyclist_map exists, fall back to cyclist_map cyclists.
+        if not cyclist_ids and cyclist_map_has_cols:
+            cyclist_ids = set(map(int, cyclist_map.get_column("cyclist_id").to_list()))
 
-        # Build corresponding bicycle IDs from cyclist_map
         bicycle_ids: set[int] = set()
-        if cyclist_map.height > 0 and cyclist_ids:
-            try:
-                bicycle_ids = set(
+        if cyclist_ids and cyclist_map_has_cols:
+            bicycle_ids = set(
+                map(
+                    int,
                     cyclist_map.filter(pl.col("cyclist_id").is_in(list(cyclist_ids)))
                     .get_column("bicycle_id")
-                    .to_list()
+                    .to_list(),
                 )
-                bicycle_ids = set(int(x) for x in bicycle_ids)
-            except Exception:
-                bicycle_ids = set()
+            )
 
-        object_ids_to_draw = cyclist_ids | bicycle_ids
+        object_ids_to_draw: set[int] = cyclist_ids | bicycle_ids
 
-        # For nicer labels: bicycle_id -> cyclist_id (rider)
+        # Map bicycle_id -> cyclist_id for nicer labels
         bike_to_cyclist: dict[int, int] = {}
-        if cyclist_map.height > 0:
-            try:
-                for r in cyclist_map.select(["bicycle_id", "cyclist_id"]).iter_rows(named=True):
+        if cyclist_map_has_cols:
+            for r in cyclist_map.select(["bicycle_id", "cyclist_id"]).iter_rows(named=True):
+                try:
                     bike_to_cyclist[int(r["bicycle_id"])] = int(r["cyclist_id"])
-            except Exception:
-                bike_to_cyclist = {}
+                except Exception:
+                    continue
 
-        # Pre-index the CSV rows we care about: frame -> list[rows]
+        # -----------------------------
+        # Build episode intervals (roles)
+        # -----------------------------
+        leader_col: Optional[str] = None
+        if episodes is not None and episodes.height > 0:
+            if "leader_id" in episodes.columns:
+                leader_col = "leader_id"
+            elif "following_id" in episodes.columns:
+                leader_col = "following_id"
+
+        intervals: list[tuple[int, int, int, int]] = []  # (start, end, follower_id, leader_id)
+        if leader_col is not None:
+            needed = {"start_frame", "end_frame", "follower_id", leader_col}
+            missing = needed - set(episodes.columns)
+            if missing:
+                raise ValueError(f"episodes is missing required columns for roles: {sorted(missing)}")
+
+            for r in episodes.select(["start_frame", "end_frame", "follower_id", leader_col]).iter_rows(named=True):
+                intervals.append(
+                    (
+                        int(r["start_frame"]),
+                        int(r["end_frame"]),
+                        int(r["follower_id"]),
+                        int(r[leader_col]),
+                    )
+                )
+
+        def roles_for_frame(frame_count: int) -> tuple[dict[int, str], dict[int, int]]:
+            """roles: cyclist_id -> role; active_pairs: follower_id -> leader_id"""
+            roles: dict[int, str] = {}
+            active_pairs: dict[int, int] = {}
+            for s, e, fid, lid in intervals:
+                if s <= frame_count <= e:
+                    roles[fid] = "follower"
+                    roles[lid] = "leader"
+                    active_pairs[fid] = lid
+            return roles, active_pairs
+
+        # -----------------------------
+        # Pre-index bboxes by frame
+        # -----------------------------
         frame_to_rows: dict[int, list[dict]] = {}
         if df.height > 0 and object_ids_to_draw:
             wanted = (
@@ -466,50 +507,26 @@ class Analysis():
                 fc = int(row["frame-count"])
                 frame_to_rows.setdefault(fc, []).append(row)
 
-        # CSV bbox coordinates are normalised to [0,1] (YOLO format) in this project.
-        # We therefore always interpret x-center/y-center/width/height as normalised values.
+        # Coordinates are YOLO-normalized [0,1] in this project
         coords_normalised = True
 
-        # Episode intervals for quick role lookup
-        intervals: list[tuple[int, int, int, int]] = []
-        if episodes.height > 0:
-            try:
-                leader_col = "leader_id" if "leader_id" in episodes.columns else "following_id"
-                for r in episodes.select(["start_frame", "end_frame",
-                                          "follower_id", leader_col]).iter_rows(named=True):
-                    intervals.append((int(r["start_frame"]), int(r["end_frame"]),
-                                      int(r["follower_id"]), int(r[leader_col])))
-
-            except Exception:
-                intervals = []
-
-        def roles_for_frame(frame_count: int) -> tuple[dict[int, str], dict[int, int]]:
-            """Return (roles, active_pairs) for a given frame.
-
-            roles maps cyclist_id -> {"follower","leader","normal"} (normal implied when absent).
-            active_pairs maps follower_id -> leader_id for pairs active on this frame.
-            """
-            roles: dict[int, str] = {}
-            active_pairs: dict[int, int] = {}
-            for s, e, fid, lid in intervals:
-                if s <= frame_count <= e:
-                    roles[fid] = "follower"
-                    roles[lid] = "leader"
-                    active_pairs[fid] = lid
-            return roles, active_pairs
-
+        # -----------------------------
+        # Open input + output video
+        # -----------------------------
         cap = cv2.VideoCapture(input_video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {input_video_path}")
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if width <= 0 or height <= 0:
+            cap.release()
+            raise RuntimeError(f"Invalid video dimensions for: {input_video_path} (w={width}, h={height})")
 
-        fps = (
-            float(fps_override)
-            if (fps_override is not None and float(fps_override) > 0)
-            else float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
-        )
+        if fps_override is not None and float(fps_override) > 0:
+            fps = float(fps_override)
+        else:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore
         out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
@@ -517,6 +534,9 @@ class Analysis():
             cap.release()
             raise RuntimeError(f"Could not open VideoWriter: {output_video_path}")
 
+        # -----------------------------
+        # Main loop
+        # -----------------------------
         frame_idx = 0
         try:
             while True:
@@ -527,6 +547,7 @@ class Analysis():
                 csv_frame = frame_idx + int(frame_offset)
                 roles, active_pairs = roles_for_frame(csv_frame)
 
+                # Draw all bboxes for this CSV frame
                 for row in frame_to_rows.get(csv_frame, []):
                     yolo_id = int(row["yolo-id"])
                     obj_id = int(row["unique-id"])
@@ -535,30 +556,24 @@ class Analysis():
                     yc = float(row["y-center"])
                     w = float(row["width"])
                     h = float(row["height"])
-                    # CSV coords are normalised to [0,1] (YOLO format). Convert to pixel coords for drawing.
+
                     if coords_normalised:
-                        xc_px = xc * width
-                        yc_px = yc * height
-                        w_px = w * width
-                        h_px = h * height
-                    else:
-                        xc_px = xc
-                        yc_px = yc
-                        w_px = w
-                        h_px = h
+                        xc *= width
+                        yc *= height
+                        w *= width
+                        h *= height
 
-                    x1 = int(round(xc_px - w_px / 2.0))
-                    y1 = int(round(yc_px - h_px / 2.0))
-                    x2 = int(round(xc_px + w_px / 2.0))
-                    y2 = int(round(yc_px + h_px / 2.0))
+                    x1 = int(round(xc - w / 2.0))
+                    y1 = int(round(yc - h / 2.0))
+                    x2 = int(round(xc + w / 2.0))
+                    y2 = int(round(yc + h / 2.0))
 
-                    # Clip to frame bounds
+                    # clip to bounds
                     x1 = max(0, min(width - 1, x1))
                     x2 = max(0, min(width - 1, x2))
                     y1 = max(0, min(height - 1, y1))
                     y2 = max(0, min(height - 1, y2))
 
-                    # Colors: follower (red), leader (green), normal (orange), bicycle (blue)
                     if yolo_id == 0:  # cyclist/person
                         role = roles.get(obj_id, "normal")
                         if role == "follower":
@@ -568,44 +583,34 @@ class Analysis():
                         else:
                             color = COLOR_CYCLIST_NORMAL
                         label = f"{role}:{obj_id}"
-                    else:  # bicycle / other object
+                    else:  # bicycle (or other)
                         color = COLOR_BICYCLE
                         rider_id = bike_to_cyclist.get(obj_id)
                         label = f"bicycle:{obj_id}" if rider_id is None else f"bicycle:{obj_id} rider:{rider_id}"
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
                     if draw_labels:
-
                         cv2.putText(
-
                             frame,
-
                             label,
-
                             (x1, max(0, y1 - 6)),
-
                             cv2.FONT_HERSHEY_SIMPLEX,
-
                             0.5,
-
                             color,
-
                             1,
-
                             cv2.LINE_AA,
-
                         )
 
-                # Optional overlay: show who is following whom on this frame.
+                # Optional overlay: active pairs
                 if draw_pair_overlay and active_pairs:
-                    y0 = 28
-                    x0 = 12
-                    for idx, (fid, lid) in enumerate(sorted(active_pairs.items())):
+                    x0, y0 = 12, 28
+                    for i, (fid, lid) in enumerate(sorted(active_pairs.items())):
                         txt = f"Follower {fid} -> Leader {lid}"
                         cv2.putText(
                             frame,
                             txt,
-                            (x0, y0 + 18 * idx),
+                            (x0, y0 + 18 * i),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.6,
                             (255, 255, 255),
@@ -615,6 +620,7 @@ class Analysis():
 
                 out.write(frame)
                 frame_idx += 1
+
         finally:
             cap.release()
             out.release()
@@ -746,7 +752,11 @@ if __name__ == "__main__":
         ftp_password=common.get_secrets("ftp_password"),
     )
 
-    df_mapping = pl.read_csv(common.get_configs("mapping"))
+    mapping_path = common.get_configs("mapping")
+    df_mapping = pl.read_csv(
+        mapping_path,
+        schema_overrides={"literacy_rate": pl.Float64},
+    )
 
     countries_analyse: list[str] = common.get_configs("countries_analyse")
 
@@ -788,7 +798,20 @@ if __name__ == "__main__":
 
             # Polars read + filter
             df = pl.read_csv(file_path)
-            df = df.filter(pl.col("confidence") >= min_conf)
+
+            df = (
+                df
+                # 1) drop invalid IDs early
+                .filter(pl.col("unique-id") != -1)
+                # 2) enforce join-key dtype compatibility (avoid crashes if some rows look like 15.0)
+                .with_columns(
+                    pl.col("unique-id").cast(pl.Int64, strict=False)
+                )
+                # 3) drop rows that couldn't be cast to int
+                .filter(pl.col("unique-id").is_not_null())
+                # 4) your existing confidence filter
+                .filter(pl.col("confidence") >= min_conf)
+            )
 
             # After reading the file, clean up the filename
             base_name = tools.clean_csv_filename(file_str)
@@ -840,7 +863,7 @@ if __name__ == "__main__":
 
             # If enabled, download the source video and generate an annotated video for this CSV segment
             logger.info(f"{file_str}: annotation pipeline triggered (DOWNLOAD_AND_ANNOTATE={DOWNLOAD_AND_ANNOTATE},bicyclists={cyclist_map.height})")  # noqa: E501
-            should_annotate = bool(DOWNLOAD_AND_ANNOTATE) and (cyclist_map.height > 0)
+            should_annotate = bool(DOWNLOAD_AND_ANNOTATE) and (episodes.height > 0)
 
             # If cropping is enabled and we're NOT writing full segments, only process segments where following exists.
 
