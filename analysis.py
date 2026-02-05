@@ -53,6 +53,22 @@ def _cfg_float(key: str, default: float) -> float:
         return default
 
 
+def _cfg_float_opt(key: str, default: Optional[float] = None) -> Optional[float]:
+    """Best-effort optional float config lookup.
+
+    Returns default when config is missing, None, or an empty string.
+    """
+    try:
+        v = common.get_configs(key)
+        if v is None:
+            return default
+        if isinstance(v, str) and v.strip() == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
 # When True: if cyclist-following episodes are detected in a CSV, the script will
 # download the corresponding source video and generate an annotated video showing
 # the involved cyclists (and their bicycles) across the entire CSV segment.
@@ -88,6 +104,9 @@ ANNOTATE_WHOLE_SEGMENT: bool = _cfg_bool("ANNOTATE_WHOLE_SEGMENT", False)
 CROP_AROUND_FOLLOWING: bool = _cfg_bool("CROP_AROUND_FOLLOWING", False)
 CROP_PRE_SECONDS: float = _cfg_float("CROP_PRE_SECONDS", 5.0)
 CROP_POST_GONE_SECONDS: float = _cfg_float("CROP_POST_GONE_SECONDS", 6.0)
+# If set (>0): require leader & follower track overlap for at least this many seconds.
+# If empty/missing: include all.
+MIN_CO_VISIBLE_SECONDS: Optional[float] = _cfg_float_opt("MIN_CO_VISIBLE_SECONDS", None)
 # If True and CROP_AROUND_FOLLOWING is enabled, also write the full-segment annotated video.
 ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING: bool = _cfg_bool("ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING", False)
 
@@ -847,8 +866,9 @@ if __name__ == "__main__":
                     lat_max=0.1,
                     min_follow_frames=10,
                     gap_allow=10,
+                    min_co_visible_seconds=MIN_CO_VISIBLE_SECONDS,
                 ),
-                fps=None,
+                fps=fps_csv,
             )
             logger.info(str(cyclist_map))
 
@@ -965,6 +985,29 @@ if __name__ == "__main__":
                             except Exception:
                                 continue
 
+                            # Crop start should be based on visibility (earliest appearance of either cyclist),
+                            # not the first following-episode start.
+                            try:
+                                first_f = states.filter(pl.col('cyclist_id') == fid_i
+                                                        ).select(pl.min('frame-count')).item()
+                            except Exception:
+                                first_f = None
+                            try:
+                                first_l = states.filter(pl.col('cyclist_id') == lid_i
+                                                        ).select(pl.min('frame-count')).item()
+                            except Exception:
+                                first_l = None
+
+                            first_frames: list[int] = []
+                            for v in (first_f, first_l):
+                                if v is not None:
+                                    try:
+                                        first_frames.append(int(v))
+                                    except Exception:
+                                        pass
+                            first_any = min(first_frames + [int(first_encounter)]
+                                            ) if first_frames else int(first_encounter)
+
                             # 2) 'Gone' = first frame AFTER the last time either cyclist appears (based on states).
                             try:
                                 last_f = states.filter(pl.col('cyclist_id') == fid_i
@@ -992,7 +1035,7 @@ if __name__ == "__main__":
                             last_any = max(last_frames + [int(fallback_last)]) if last_frames else int(fallback_last)
                             gone_frame = min(max_frame + 1, int(last_any) + 1)
 
-                            crop_start_frame = max(min_frame, int(first_encounter) - pre_frames)
+                            crop_start_frame = max(min_frame, int(first_any) - pre_frames)
                             crop_end_frame = min(max_frame, int(gone_frame) + post_frames)
 
                             # Ensure at least ~1 second of output (VideoFileClip can error on empty subclips).

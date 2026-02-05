@@ -121,8 +121,11 @@ Configuration of the project needs to be defined in `config`. Please use the `de
 - **`CROP_AROUND_FOLLOWING`**: If `true`, when cycle-following is detected, outputs cropped annotated clips around each follower → leader pair.
 - **`CROP_PRE_SECONDS`**: Number of seconds to include before the first encounter of the follower/leader pair.
 - **`CROP_POST_GONE_SECONDS`**: Number of seconds to include after both follower and leader have disappeared from the frame.
+- **`MIN_CO_VISIBLE_SECONDS`** *(optional)*: Minimum co-visibility requirement for a follower/leader pair.  
+  A follower → leader relationship is only considered if **both the follower and the leader are visible together for at least `n` seconds** in the segment; otherwise the pair is excluded from observation.
 - **`ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING`**: If `true`, also writes the full-segment annotated video in addition to the cropped clips.
 - **`ANNOTATE_WHOLE_SEGMENT`**: If `true`, generates an annotated video for the **entire** CSV segment (download → trim to segment → annotate), regardless of whether cycle-following is detected. If used together with `CROP_AROUND_FOLLOWING=true`, the pipeline can output both full-segment annotated videos (for all segments) and cropped following clips (only for segments where following is detected).
+- **`DELETE_DOWNLOADED_VIDEO_ON_COMPLETE`**: If `true`, deletes the downloaded source video after processing is complete (useful to save disk space).
 - **`logger_level`**: Level of console output. Can be: debug, info, warning, error.
 - **`font_family`**: Specifies the font family to be used in outputs.
 - **`font_size`**: Specifies the font size to be used in outputs.
