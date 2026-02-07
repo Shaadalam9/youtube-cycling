@@ -464,7 +464,7 @@ class Analysis():
                 )
             )
 
-        object_ids_to_draw: set[int] = cyclist_ids | bicycle_ids
+        object_ids_to_draw: set[int] = cyclist_ids | bicycle_ids  # noqa: F841
 
         # Map bicycle_id -> cyclist_id for nicer labels
         bike_to_cyclist: dict[int, int] = {}
@@ -516,17 +516,23 @@ class Analysis():
         # -----------------------------
         # Pre-index bboxes by frame
         # -----------------------------
+        # IMPORTANT: many trackers reuse `unique-id` across classes. If we filter by `unique-id` only,
+        # we can accidentally pull a CAR row (yolo-id=2) that shares the same unique-id as a BICYCLE row (yolo-id=1),
+        # and then it gets drawn with the wrong label. To avoid that, we filter by BOTH class and id.
         frame_to_rows: dict[int, list[dict]] = {}
-        if df.height > 0 and object_ids_to_draw:
+        if df.height > 0 and (cyclist_ids or bicycle_ids):
             wanted = (
-                df.filter(pl.col("unique-id").is_in(list(object_ids_to_draw)))
+                df.filter(
+                    ((pl.col("yolo-id") == 0) & (pl.col("unique-id").is_in(list(cyclist_ids)))) |
+                    ((pl.col("yolo-id") == 1) & (pl.col("unique-id").is_in(list(bicycle_ids))))
+                )
                 .select(["frame-count", "yolo-id", "unique-id", "x-center", "y-center", "width", "height"])
             )
             for row in wanted.iter_rows(named=True):
                 fc = int(row["frame-count"])
                 frame_to_rows.setdefault(fc, []).append(row)
 
-        # Coordinates are YOLO-normalized [0,1] in this project
+# Coordinates are YOLO-normalized [0,1] in this project
         coords_normalised = True
 
         # -----------------------------
@@ -602,10 +608,13 @@ class Analysis():
                         else:
                             color = COLOR_CYCLIST_NORMAL
                         label = f"{role}:{obj_id}"
-                    else:  # bicycle (or other)
+                    elif yolo_id == 1:  # bicycle
                         color = COLOR_BICYCLE
                         rider_id = bike_to_cyclist.get(obj_id)
                         label = f"bicycle:{obj_id}" if rider_id is None else f"bicycle:{obj_id} rider:{rider_id}"
+                    else:
+                        # Skip all other object classes (e.g., cars/buses/trucks).
+                        continue
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
@@ -774,7 +783,10 @@ if __name__ == "__main__":
     mapping_path = common.get_configs("mapping")
     df_mapping = pl.read_csv(
         mapping_path,
-        schema_overrides={"literacy_rate": pl.Float64},
+        schema_overrides={
+            "literacy_rate": pl.Float64,
+            "gmp": pl.Float64,   # <-- add this
+        },
     )
 
     countries_analyse: list[str] = common.get_configs("countries_analyse")
@@ -979,64 +991,42 @@ if __name__ == "__main__":
                             if pair_eps.height == 0:
                                 continue
 
-                            # 1) First encounter = first start_frame for this pair.
+                            # Crop window based on FOLLOWING EPISODES (not full visibility), per follower->leader pair.
                             try:
-                                first_encounter = int(pair_eps.select(pl.min('start_frame')).item())
+                                pair_start = int(pair_eps.select(pl.min('start_frame')).item())
+                                pair_end = int(pair_eps.select(pl.max('end_frame')).item())
                             except Exception:
                                 continue
 
-                            # Crop start should be based on visibility (earliest appearance of either cyclist),
-                            # not the first following-episode start.
-                            try:
-                                first_f = states.filter(pl.col('cyclist_id') == fid_i
-                                                        ).select(pl.min('frame-count')).item()
-                            except Exception:
-                                first_f = None
-                            try:
-                                first_l = states.filter(pl.col('cyclist_id') == lid_i
-                                                        ).select(pl.min('frame-count')).item()
-                            except Exception:
-                                first_l = None
+                            crop_start_frame = max(min_frame, int(pair_start) - pre_frames)
+                            crop_end_frame = min(max_frame, int(pair_end) + post_frames)
 
-                            first_frames: list[int] = []
-                            for v in (first_f, first_l):
-                                if v is not None:
-                                    try:
-                                        first_frames.append(int(v))
-                                    except Exception:
-                                        pass
-                            first_any = min(first_frames + [int(first_encounter)]
-                                            ) if first_frames else int(first_encounter)
-
-                            # 2) 'Gone' = first frame AFTER the last time either cyclist appears (based on states).
-                            try:
-                                last_f = states.filter(pl.col('cyclist_id') == fid_i
-                                                       ).select(pl.max('frame-count')).item()
-                            except Exception:
-                                last_f = None
-                            try:
-                                last_l = states.filter(pl.col('cyclist_id') == lid_i
-                                                       ).select(pl.max('frame-count')).item()
-                            except Exception:
-                                last_l = None
-
-                            try:
-                                fallback_last = int(pair_eps.select(pl.max('end_frame')).item())
-                            except Exception:
-                                fallback_last = first_encounter
-
-                            last_frames: list[int] = []
-                            for v in (last_f, last_l):
-                                if v is not None:
-                                    try:
-                                        last_frames.append(int(v))
-                                    except Exception:
-                                        pass
-                            last_any = max(last_frames + [int(fallback_last)]) if last_frames else int(fallback_last)
-                            gone_frame = min(max_frame + 1, int(last_any) + 1)
-
-                            crop_start_frame = max(min_frame, int(first_any) - pre_frames)
-                            crop_end_frame = min(max_frame, int(gone_frame) + post_frames)
+                            # Optional: enforce that BOTH cyclist tracks are visible together for at least
+                            # MIN_CO_VISIBLE_SECONDS *within the cropped output*.
+                            # This prevents clips where "following" is detected briefly but one track is mostly absent.
+                            if MIN_CO_VISIBLE_SECONDS is not None and float(MIN_CO_VISIBLE_SECONDS) > 0 and fps_value > 0:  # noqa: E501
+                                min_coviz_frames = int(math.ceil(float(MIN_CO_VISIBLE_SECONDS) * float(fps_value)))
+                                try:
+                                    coviz = (
+                                        states
+                                        .filter(
+                                            (pl.col('frame-count') >= crop_start_frame) &
+                                            (pl.col('frame-count') <= crop_end_frame) &
+                                            (pl.col('cyclist_id').is_in([fid_i, lid_i]))
+                                        )
+                                        .group_by('frame-count')
+                                        .agg(pl.col('cyclist_id').n_unique().alias('n'))
+                                        .filter(pl.col('n') >= 2)
+                                        .height
+                                    )
+                                except Exception:
+                                    coviz = 0
+                                if int(coviz) < int(min_coviz_frames):
+                                    logger.info(
+                                        f"{file_str}: skipping crop for follower {fid_i} -> leader {lid_i}: "
+                                        f"co-visible frames in crop {coviz} < required {min_coviz_frames}"
+                                    )
+                                    continue
 
                             # Ensure at least ~1 second of output (VideoFileClip can error on empty subclips).
                             if crop_end_frame <= crop_start_frame:
@@ -1062,7 +1052,7 @@ if __name__ == "__main__":
                                 f"(t=[{clip_start_s:.2f}s, {clip_end_s:.2f}s])"
                             )
 
-                        if ANNOTATE_WHOLE_SEGMENT or ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING or (not jobs):
+                        if ANNOTATE_WHOLE_SEGMENT or ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING:
                             _add_job(
                                 clip_start_s=float(start_seconds) + (float(min_frame) / float(fps_value) if fps_value > 0 else 0.0),  # noqa: E501
                                 clip_end_s=float(end_seconds),
@@ -1081,31 +1071,34 @@ if __name__ == "__main__":
                         )
 
                     # Execute jobs
-                    for job in jobs:
-                        clip_path = os.path.join(TRIMMED_CLIPS_DIR, job['clip_name'])
-                        annotated_path = os.path.join(ANNOTATED_VIDEOS_DIR, job['annotated_name'])
+                    if not jobs:
+                        logger.info(f"{file_str}: no valid crop jobs produced; skipping video trim/annotation.")
+                    else:
+                        for job in jobs:
+                            clip_path = os.path.join(TRIMMED_CLIPS_DIR, job['clip_name'])
+                            annotated_path = os.path.join(ANNOTATED_VIDEOS_DIR, job['annotated_name'])
 
-                        analysis.trim_video(local_video_path, clip_path, job['clip_start_s'], job['clip_end_s'])
-                        analysis.annotate_following_segment(
-                            input_video_path=clip_path,
-                            output_video_path=annotated_path,
-                            df=df,
-                            cyclist_map=cyclist_map,
-                            episodes=episodes,
-                            involved_cyclist_ids=involved_cyclists,
-                            frame_offset=int(job['frame_offset']),
-                            fps_override=fps_value,
-                            draw_all_bicyclists=ANNOTATE_ALL_BICYCLISTS,
-                            draw_pair_overlay=ANNOTATE_PAIR_OVERLAY,
-                            draw_labels=True,
-                        )
-                        logger.info(f"{file_str}: annotated video written to {annotated_path}")
+                            analysis.trim_video(local_video_path, clip_path, job['clip_start_s'], job['clip_end_s'])
+                            analysis.annotate_following_segment(
+                                input_video_path=clip_path,
+                                output_video_path=annotated_path,
+                                df=df,
+                                cyclist_map=cyclist_map,
+                                episodes=episodes,
+                                involved_cyclist_ids=involved_cyclists,
+                                frame_offset=int(job['frame_offset']),
+                                fps_override=fps_value,
+                                draw_all_bicyclists=ANNOTATE_ALL_BICYCLISTS,
+                                draw_pair_overlay=ANNOTATE_PAIR_OVERLAY,
+                                draw_labels=True,
+                            )
+                            logger.info(f"{file_str}: annotated video written to {annotated_path}")
 
-                        if not KEEP_TRIMMED_CLIP:
-                            try:
-                                os.remove(clip_path)
-                            except Exception:
-                                pass
+                            if not KEEP_TRIMMED_CLIP:
+                                try:
+                                    os.remove(clip_path)
+                                except Exception:
+                                    pass
 
                 except Exception as e:
                     logger.error(f"{file_str}: download/annotate failed: {e}")
