@@ -42,6 +42,10 @@ class FollowingParams:
     # Overlap is measured using frame-count ranges (max(min_f,min_l) .. min(max_f,max_l)).
     # If None or <= 0, include all pairs.
     min_co_visible_seconds: Optional[float] = None
+    # If True, do not filter out follower->leader pairs whose total co-visibility is below
+    # min_co_visible_seconds. Instead, include them in the output episodes so downstream
+    # code can optionally annotate and save them separately.
+    include_pairs_below_min_co_visible: bool = False
     eps: float = 1e-9
 
 
@@ -308,6 +312,11 @@ class CyclistFollowing:
             }
             if fps is not None and fps > 0:
                 schema["mean_time_headway_s"] = pl.Float64
+            if params.min_co_visible_seconds is not None and float(params.min_co_visible_seconds) > 0:
+                schema["co_visible_frames_total"] = pl.Int64
+                schema["meets_min_co_visible"] = pl.Boolean
+                if fps is not None and fps > 0:
+                    schema["co_visible_seconds_total"] = pl.Float64
             return pl.DataFrame(schema=schema)
 
         if states.height == 0:
@@ -319,10 +328,14 @@ class CyclistFollowing:
             for cid, sf in states.group_by("cyclist_id").agg(pl.col("frame-count").min()).rows()
         }
 
-        # Optional co-visibility gate: only consider follower->leader pairs whose track
-        # time overlap is at least N seconds (converted to frames using fps), based on
-        # frame-count ranges. This is robust to occasional missed detections.
+        # Optional co-visibility info and gate: follower->leader pairs whose track time overlap
+        # is at least N seconds (converted to frames using fps), based on frame-count ranges.
+        # When params.include_pairs_below_min_co_visible is True, pairs below the threshold are
+        # still considered, but the overlap duration is attached to the output for downstream
+        # filtering and annotation.
         min_coviz_frames: Optional[int] = None
+        allowed_leaders_by_follower: Optional[dict[int, np.ndarray]] = None
+        coviz_table: Optional[pl.DataFrame] = None
         if params.min_co_visible_seconds is not None and float(params.min_co_visible_seconds) > 0:
             if fps is None or fps <= 0:
                 raise ValueError(
@@ -332,8 +345,6 @@ class CyclistFollowing:
             # seconds -> frames (ceil ensures at least N seconds)
             min_coviz_frames = int(math.ceil(float(params.min_co_visible_seconds) * float(fps)))
 
-        allowed_leaders_by_follower: Optional[dict[int, np.ndarray]] = None
-        if min_coviz_frames is not None:
             # compute min/max frame-count per cyclist
             rng_rows = (
                 states.group_by("cyclist_id")
@@ -346,7 +357,10 @@ class CyclistFollowing:
             rng = {int(cid): (int(mn), int(mx)) for cid, mn, mx in rng_rows}
             cyclist_ids = sorted(rng.keys())
 
-            allowed_leaders_by_follower = {}
+            coviz_rows: list[dict] = []
+            if not bool(params.include_pairs_below_min_co_visible):
+                allowed_leaders_by_follower = {}
+
             for fid in cyclist_ids:
                 fmn, fmx = rng[fid]
                 allowed: list[int] = []
@@ -356,12 +370,21 @@ class CyclistFollowing:
                     lmn, lmx = rng[lid]
                     ov_start = max(fmn, lmn)
                     ov_end = min(fmx, lmx)
-                    if ov_end >= ov_start:
-                        ov_len = (ov_end - ov_start + 1)
-                        if ov_len >= int(min_coviz_frames):
-                            allowed.append(lid)
-                allowed_leaders_by_follower[fid] = np.asarray(allowed, dtype=np.int64)
+                    ov_len = (ov_end - ov_start + 1) if ov_end >= ov_start else 0
+                    coviz_rows.append(
+                        {
+                            "follower_id": int(fid),
+                            "leader_id": int(lid),
+                            "co_visible_frames_total": int(ov_len),
+                        }
+                    )
+                    if allowed_leaders_by_follower is not None and int(ov_len) >= int(min_coviz_frames):
+                        allowed.append(int(lid))
+                if allowed_leaders_by_follower is not None:
+                    allowed_leaders_by_follower[int(fid)] = np.asarray(allowed, dtype=np.int64)
 
+            if coviz_rows:
+                coviz_table = pl.DataFrame(coviz_rows)
         # If the user did not specify a lead-in, use a conservative default.
         leader_min_lead_frames = (
             int(params.leader_min_lead_frames)
@@ -582,6 +605,22 @@ class CyclistFollowing:
             (pl.col("follower_id").cast(pl.Utf8) + pl.lit("->") + pl.col("leader_id").cast(pl.Utf8)).alias("pair")
         )
 
+
+        if coviz_table is not None:
+            ep = (
+                ep.join(coviz_table, on=["follower_id", "leader_id"], how="left")
+                .with_columns(
+                    pl.col("co_visible_frames_total").fill_null(0).cast(pl.Int64)
+                )
+            )
+            if min_coviz_frames is not None:
+                ep = ep.with_columns(
+                    (pl.col("co_visible_frames_total") >= int(min_coviz_frames)).alias("meets_min_co_visible")
+                )
+            if fps is not None and fps > 0:
+                ep = ep.with_columns(
+                    (pl.col("co_visible_frames_total") / float(fps)).alias("co_visible_seconds_total")
+                )
         if fps is not None and fps > 0:
             ep = ep.with_columns(
                 (pl.col("mean_time_headway_frames") / float(fps)).alias("mean_time_headway_s")

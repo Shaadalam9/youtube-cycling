@@ -107,6 +107,9 @@ CROP_POST_GONE_SECONDS: float = _cfg_float("CROP_POST_GONE_SECONDS", 6.0)
 # If set (>0): require leader & follower track overlap for at least this many seconds.
 # If empty/missing: include all.
 MIN_CO_VISIBLE_SECONDS: Optional[float] = _cfg_float_opt("MIN_CO_VISIBLE_SECONDS", None)
+# If True and MIN_CO_VISIBLE_SECONDS is set (>0): do not skip crop clips that fail the co-visibility
+# requirement. Instead, still annotate them and save them into a separate output folder.
+ANNOTATE_BELOW_MIN_CO_VISIBLE_SECONDS: bool = _cfg_bool("ANNOTATE_BELOW_MIN_CO_VISIBLE_SECONDS", False)
 # If True and CROP_AROUND_FOLLOWING is enabled, also write the full-segment annotated video.
 ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING: bool = _cfg_bool("ALSO_WRITE_FULL_SEGMENT_WHEN_CROPPING", False)
 
@@ -773,9 +776,6 @@ if __name__ == "__main__":
     # Load secrets (email + FTP credentials)
     # ---------------------------------------------------------------------
     secret = SimpleNamespace(
-        email_smtp=common.get_secrets("email_smtp"),
-        email_account=common.get_secrets("email_account"),
-        email_password=common.get_secrets("email_password"),
         ftp_username=common.get_secrets("ftp_username"),
         ftp_password=common.get_secrets("ftp_password"),
     )
@@ -879,6 +879,7 @@ if __name__ == "__main__":
                     min_follow_frames=10,
                     gap_allow=10,
                     min_co_visible_seconds=MIN_CO_VISIBLE_SECONDS,
+                    include_pairs_below_min_co_visible=ANNOTATE_BELOW_MIN_CO_VISIBLE_SECONDS,
                 ),
                 fps=fps_csv,
             )
@@ -955,16 +956,55 @@ if __name__ == "__main__":
                     os.makedirs(TRIMMED_CLIPS_DIR, exist_ok=True)
                     os.makedirs(ANNOTATED_VIDEOS_DIR, exist_ok=True)
 
+                    def _sec_tag(val: float) -> str:
+                        # File system friendly tag, eg 12.5 -> 12p5
+                        s = f"{float(val):g}"
+                        return s.replace('.', 'p')
+
+                    # Bucket size for co visible time folders when keeping clips below MIN_CO_VISIBLE_SECONDS.
+                    # Default is 1 second buckets: coviz_2_3s, coviz_3_4s, ...
+                    CO_VISIBLE_BUCKET_SECONDS: float = 1.0
+
+                    coviz_ge_dir: Optional[str] = None
+                    coviz_bucket_cache: dict[tuple[str, str], str] = {}
+
+                    if (
+                        ANNOTATE_BELOW_MIN_CO_VISIBLE_SECONDS
+                        and MIN_CO_VISIBLE_SECONDS is not None
+                        and float(MIN_CO_VISIBLE_SECONDS) > 0
+                    ):
+                        tag = _sec_tag(float(MIN_CO_VISIBLE_SECONDS))
+                        coviz_ge_dir = os.path.join(ANNOTATED_VIDEOS_DIR, f"coviz_ge_{tag}s")
+                        os.makedirs(coviz_ge_dir, exist_ok=True)
+
+                    def _bucket_dir(seconds: float) -> str:
+                        # seconds is the co visible time within the crop window
+                        b = float(CO_VISIBLE_BUCKET_SECONDS) if CO_VISIBLE_BUCKET_SECONDS is not None else 1.0
+                        if b <= 0:
+                            b = 1.0
+                        s = max(0.0, float(seconds))
+                        low = math.floor(s / b) * b
+                        high = low + b
+                        low_tag = _sec_tag(low)
+                        high_tag = _sec_tag(high)
+                        key = (low_tag, high_tag)
+                        if key not in coviz_bucket_cache:
+                            d = os.path.join(ANNOTATED_VIDEOS_DIR, f"coviz_{low_tag}_{high_tag}s")
+                            os.makedirs(d, exist_ok=True)
+                            coviz_bucket_cache[key] = d
+                        return coviz_bucket_cache[key]
+
                     jobs: list[dict] = []
 
                     def _add_job(*, clip_start_s: float, clip_end_s: float, frame_offset: int,
-                                 clip_name: str, annotated_name: str) -> None:
+                                 clip_name: str, annotated_name: str, annotated_dir: Optional[str] = None) -> None:
                         jobs.append({
                             'clip_start_s': float(clip_start_s),
                             'clip_end_s': float(clip_end_s),
                             'frame_offset': int(frame_offset),
                             'clip_name': str(clip_name),
                             'annotated_name': str(annotated_name),
+                            'annotated_dir': str(annotated_dir) if annotated_dir is not None else str(ANNOTATED_VIDEOS_DIR),  # noqa: E501
                         })
 
                     # Default (full CSV segment) job definition
@@ -985,6 +1025,7 @@ if __name__ == "__main__":
                         for fid, lid in pairs.select(['follower_id', 'leader_id']).iter_rows():
                             fid_i = int(fid)
                             lid_i = int(lid)
+                            annotated_dir_for_pair: str = ANNOTATED_VIDEOS_DIR
 
                             pair_eps = episodes.filter((pl.col('follower_id') == fid_i
                                                         ) & (pl.col('leader_id') == lid_i))
@@ -1021,12 +1062,28 @@ if __name__ == "__main__":
                                     )
                                 except Exception:
                                     coviz = 0
-                                if int(coviz) < int(min_coviz_frames):
+                                coviz_frames_in_crop = int(coviz)
+                                coviz_seconds_in_crop = float(coviz_frames_in_crop) / float(fps_value) if fps_value > 0 else 0.0  # noqa: E501
+                                meets_min_coviz = coviz_frames_in_crop >= int(min_coviz_frames)
+
+                                if bool(meets_min_coviz):
+                                    if coviz_ge_dir is not None:
+                                        annotated_dir_for_pair = coviz_ge_dir
+                                else:
+                                    if not bool(ANNOTATE_BELOW_MIN_CO_VISIBLE_SECONDS):
+                                        logger.info(
+                                            f"{file_str}: skipping crop for follower {fid_i} -> leader {lid_i}: "
+                                            f"co visible frames in crop {coviz_frames_in_crop} < required {min_coviz_frames}"  # noqa: E501
+                                        )
+                                        continue
+
+                                    annotated_dir_for_pair = _bucket_dir(coviz_seconds_in_crop)
                                     logger.info(
-                                        f"{file_str}: skipping crop for follower {fid_i} -> leader {lid_i}: "
-                                        f"co-visible frames in crop {coviz} < required {min_coviz_frames}"
+                                        f"{file_str}: keeping crop for follower {fid_i} -> leader {lid_i} even though "
+                                        f"co visible frames in crop {coviz_frames_in_crop} < required {min_coviz_frames}."  # noqa: E501
+                                        f"Co visible time in crop is {coviz_seconds_in_crop:.2f}s. "
+                                        f"Output will be written under {annotated_dir_for_pair}"
                                     )
-                                    continue
 
                             # Ensure at least ~1 second of output (VideoFileClip can error on empty subclips).
                             if crop_end_frame <= crop_start_frame:
@@ -1045,6 +1102,7 @@ if __name__ == "__main__":
                                 frame_offset=crop_start_frame,
                                 clip_name=clip_name,
                                 annotated_name=annotated_name,
+                                annotated_dir=annotated_dir_for_pair,
                             )
                             logger.info(
                                 f"{file_str}: crop window for follower {fid_i} -> leader {lid_i}: "
@@ -1076,7 +1134,9 @@ if __name__ == "__main__":
                     else:
                         for job in jobs:
                             clip_path = os.path.join(TRIMMED_CLIPS_DIR, job['clip_name'])
-                            annotated_path = os.path.join(ANNOTATED_VIDEOS_DIR, job['annotated_name'])
+                            out_dir = job.get('annotated_dir', ANNOTATED_VIDEOS_DIR)
+                            os.makedirs(out_dir, exist_ok=True)
+                            annotated_path = os.path.join(out_dir, job['annotated_name'])
 
                             analysis.trim_video(local_video_path, clip_path, job['clip_start_s'], job['clip_end_s'])
                             analysis.annotate_following_segment(
