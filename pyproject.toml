@@ -19,3 +19,8 @@ dependencies = [
     "requests>=2.32.5",
     "tqdm>=4.67.1",
 ]
+
+[dependency-groups]
+dev = [
+    "flake8>=7.3.0",
+]

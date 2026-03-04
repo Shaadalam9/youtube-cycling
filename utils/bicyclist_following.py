@@ -605,7 +605,6 @@ class CyclistFollowing:
             (pl.col("follower_id").cast(pl.Utf8) + pl.lit("->") + pl.col("leader_id").cast(pl.Utf8)).alias("pair")
         )
 
-
         if coviz_table is not None:
             ep = (
                 ep.join(coviz_table, on=["follower_id", "leader_id"], how="left")
